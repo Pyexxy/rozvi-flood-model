@@ -1,0 +1,31 @@
+# Rozvi Flood Model — default configuration
+# Override on the command line or by pointing --config at another file.
+
+model:
+  name: Rozvi Flood Model
+  version: "1.1.0"
+
+segmentation:
+  length_m: 100
+  corridor_half_width_m: 15
+  max_segments: 5000
+
+# Multi-criteria weights (must sum to 1.0)
+weights:
+  precip: 0.30
+  dist_water: 0.25
+  lulc: 0.20
+  slope: 0.15
+  dem: 0.10
+
+# Screening threshold on the 1–10 susceptibility scale
+screening_threshold: 7.0
+
+# Adaptive percentile stretch for driver scaling
+percentile_low: 2
+percentile_high: 98
+
+reporting:
+  portfolio_name: "Road corridor portfolio"
+  write_docx: true
+  write_geojson: true

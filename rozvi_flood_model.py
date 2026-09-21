@@ -1,0 +1,1032 @@
+#!/usr/bin/env python3
+"""
+Rozvi Flood Model
+=================
+
+Corridor-scale flood susceptibility screening for linear assets (roads).
+
+The model scores fixed-length road segments using a weighted combination of
+terrain and hydro-meteorological drivers, maps scores onto a 0-100 risk
+category scale, and writes tabular, geospatial and Word report outputs.
+
+This is a screening tool. It does not compute return-period flood depths,
+defence performance, climate scenario depths, or financial loss (EAL/PML).
+Those fields are reported as not assessed where a full hazard engine would
+populate them.
+
+Usage
+-----
+    python rozvi_flood_model.py --roads data/roads.geojson --outdir outputs
+
+    python rozvi_flood_model.py \\
+        --roads data/roads.geojson \\
+        --dem data/dem.tif \\
+        --outdir outputs \\
+        --portfolio-name "Harare-Beitbridge Road"
+
+Dependencies are listed in requirements.txt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+import uuid
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import LineString, MultiLineString, mapping
+    from shapely.ops import substring
+except ImportError as exc:
+    sys.exit("geopandas and shapely are required. Install from requirements.txt\n" + str(exc))
+
+try:
+    import rasterio
+    from rasterio import features, transform as rio_transform
+    from rasterio.enums import Resampling
+    from rasterio.warp import calculate_default_transform, reproject
+    from rasterio.windows import from_bounds
+except ImportError as exc:
+    sys.exit("rasterio is required. Install from requirements.txt\n" + str(exc))
+
+try:
+    from scipy import ndimage
+except ImportError:
+    ndimage = None
+
+try:
+    from docx import Document
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+
+# ---------------------------------------------------------------------------
+# Model constants
+# ---------------------------------------------------------------------------
+
+MODEL_NAME = "Rozvi Flood Model"
+MODEL_VERSION = "1.1.0"
+
+DEFAULT_WEIGHTS = {
+    "precip": 0.30,
+    "dist_water": 0.25,
+    "lulc": 0.20,
+    "slope": 0.15,
+    "dem": 0.10,
+}
+
+SCREENING_THRESHOLD = 7.0
+SEGMENT_LENGTH_M = 100.0
+CORRIDOR_HALF_WIDTH_M = 15.0
+MAX_SEGMENTS = 5000
+
+# Risk category bands on the 0-100 scale
+RISK_BANDS = [
+    ("Minimal", 0, 10),
+    ("Low", 11, 30),
+    ("Moderate", 31, 60),
+    ("High", 61, 85),
+    ("Extreme", 86, 100),
+]
+
+
+def risk_category_legacy(score: Optional[float]) -> str:
+    """Four-class label used in earlier corridor screening reports."""
+    if score is None or (isinstance(score, float) and math.isnan(score)):
+        return "N/A"
+    if score <= 3:
+        return "LOW"
+    if score <= 6:
+        return "MODERATE"
+    if score <= 8:
+        return "HIGH"
+    return "VERY HIGH / CRITICAL"
+
+
+def score_to_rozvi_category(score: float) -> int:
+    """Map susceptibility score (1-10) to risk category (0-100)."""
+    s = float(np.clip(score, 1.0, 10.0))
+    return int(round((s - 1.0) / 9.0 * 100.0))
+
+
+def rozvi_band(category: int) -> str:
+    """Return band name for a 0-100 category value."""
+    for name, lo, hi in RISK_BANDS:
+        if lo <= category <= hi:
+            return name
+    return "Minimal" if category < 0 else "Extreme"
+
+
+def relative_risk_score_from_category(category: int) -> int:
+    """
+    Relative risk on a 0-1,000,000 scale.
+
+    Implemented as category * 10,000 for local ranking. This is not normalised
+    to a national or global exposure baseline.
+    """
+    return int(np.clip(category, 0, 100)) * 10_000
+
+
+# ---------------------------------------------------------------------------
+# Geometry
+# ---------------------------------------------------------------------------
+
+def ensure_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if gdf.crs is None:
+        return gdf.set_crs(epsg=4326)
+    if gdf.crs.to_epsg() != 4326:
+        return gdf.to_crs(epsg=4326)
+    return gdf
+
+
+def to_metric_crs(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Project to a local UTM zone for length and buffer operations in metres."""
+    gdf = ensure_wgs84(gdf)
+    try:
+        cen = gdf.unary_union.centroid
+        zone = int((cen.x + 180) // 6) + 1
+        epsg = 32600 + zone if cen.y >= 0 else 32700 + zone
+        return gdf.to_crs(epsg=epsg)
+    except Exception:
+        return gdf.to_crs(epsg=3857)
+
+
+def cut_line_to_segments(geom, seg_len_m: float) -> List[LineString]:
+    """Split a line into pieces of approximately seg_len_m (metric CRS)."""
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, MultiLineString):
+        parts: List[LineString] = []
+        for g in geom.geoms:
+            parts.extend(cut_line_to_segments(g, seg_len_m))
+        return parts
+    if not isinstance(geom, LineString):
+        return []
+    length = geom.length
+    if length == 0:
+        return []
+    n = max(1, int(math.ceil(length / seg_len_m)))
+    segs = []
+    for i in range(n):
+        start = i * seg_len_m
+        end = min((i + 1) * seg_len_m, length)
+        if end - start < 1e-6:
+            continue
+        try:
+            piece = substring(geom, start, end)
+            if piece is not None and not piece.is_empty:
+                segs.append(piece)
+        except Exception:
+            continue
+    return segs
+
+
+def segment_roads(
+    roads_gdf: gpd.GeoDataFrame,
+    seg_len_m: float = SEGMENT_LENGTH_M,
+    max_segments: int = MAX_SEGMENTS,
+) -> gpd.GeoDataFrame:
+    """
+    Explode a road network into fixed-length segments.
+
+    Returns a GeoDataFrame in EPSG:4326 with road_id, seg_index, geometry, length_m.
+    """
+    metric = to_metric_crs(roads_gdf)
+    rows = []
+    for idx, row in metric.iterrows():
+        pieces = cut_line_to_segments(row.geometry, seg_len_m)
+        for j, piece in enumerate(pieces):
+            rows.append(
+                {
+                    "road_id": str(idx),
+                    "seg_index": j,
+                    "geometry": piece,
+                    "length_m": piece.length,
+                }
+            )
+            if len(rows) >= max_segments:
+                break
+        if len(rows) >= max_segments:
+            break
+    if not rows:
+        raise RuntimeError(
+            "No line geometries found. Provide LineString or MultiLineString features."
+        )
+    return gpd.GeoDataFrame(rows, crs=metric.crs).to_crs(epsg=4326)
+
+
+# ---------------------------------------------------------------------------
+# Raster helpers
+# ---------------------------------------------------------------------------
+
+def read_raster_window(
+    path: Path,
+    bounds: Tuple[float, float, float, float],
+) -> Tuple[np.ndarray, rasterio.Affine]:
+    """Read a WGS84 window from a GeoTIFF; reproject if the source CRS differs."""
+    with rasterio.open(path) as src:
+        from pyproj import Transformer
+
+        dst_crs = "EPSG:4326"
+        if src.crs and src.crs.to_string() != dst_crs:
+            tf = Transformer.from_crs(dst_crs, src.crs, always_xy=True)
+            x0, y0 = tf.transform(bounds[0], bounds[1])
+            x1, y1 = tf.transform(bounds[2], bounds[3])
+            rb = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        else:
+            rb = bounds
+
+        window = from_bounds(*rb, transform=src.transform)
+        data = src.read(1, window=window, boundless=True, fill_value=src.nodata or np.nan)
+        win_transform = src.window_transform(window)
+
+        if src.crs and src.crs.to_string() != dst_crs:
+            h, w = data.shape
+            dst_transform, dw, dh = calculate_default_transform(
+                src.crs, dst_crs, w, h, *rb
+            )
+            dst = np.full((dh, dw), np.nan, dtype=np.float64)
+            reproject(
+                source=data.astype(np.float64),
+                destination=dst,
+                src_transform=win_transform,
+                src_crs=src.crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+                src_nodata=src.nodata,
+                dst_nodata=np.nan,
+            )
+            return dst, dst_transform
+        return data.astype(np.float64), win_transform
+
+
+def slope_from_dem(dem: np.ndarray, transform: rasterio.Affine) -> np.ndarray:
+    """Slope in degrees from a DEM array."""
+    px = abs(transform.a)
+    py = abs(transform.e)
+    if px < 0.1:
+        # Geographic CRS: approximate metres per degree near 20 deg latitude
+        lat_m = 111_320.0
+        lon_m = 111_320.0 * math.cos(math.radians(20))
+        dx, dy = px * lon_m, py * lat_m
+    else:
+        dx, dy = px, py
+    gy, gx = np.gradient(dem.astype(np.float64), dy, dx)
+    return np.degrees(np.arctan(np.sqrt(gx ** 2 + gy ** 2)))
+
+
+def zonal_mean(geom_wgs, array: np.ndarray, transform: rasterio.Affine) -> Optional[float]:
+    """Mean of raster values under a geometry. Returns None if no valid pixels."""
+    try:
+        mask = features.geometry_mask(
+            [mapping(geom_wgs)],
+            out_shape=array.shape,
+            transform=transform,
+            invert=True,
+        )
+        vals = array[mask]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return None
+        return float(np.mean(vals))
+    except Exception:
+        return None
+
+
+def adaptive_unit_scale(
+    values: np.ndarray,
+    low_pct: float = 2,
+    high_pct: float = 98,
+    invert: bool = False,
+) -> np.ndarray:
+    """
+    Scale an array to 1-10 using AOI percentiles.
+
+    invert=True assigns lower risk to higher original values (e.g. elevation).
+    Missing values are mapped to a neutral score of 5.
+    """
+    finite = values[np.isfinite(values)]
+    if finite.size < 5:
+        return np.full_like(values, 5.0, dtype=np.float64)
+    lo = np.nanpercentile(finite, low_pct)
+    hi = np.nanpercentile(finite, high_pct)
+    if hi <= lo:
+        hi = lo + 1.0
+    scaled = np.clip((values - lo) / (hi - lo), 0, 1)
+    risk = (1.0 - scaled) * 9.0 + 1.0 if invert else scaled * 9.0 + 1.0
+    risk = np.where(np.isfinite(values), risk, 5.0)
+    return np.clip(risk, 1.0, 10.0)
+
+
+def try_download_srtm(bounds: Tuple[float, float, float, float], dest: Path) -> Optional[Path]:
+    """Optional public SRTM clip via the elevation package (no cloud project ID)."""
+    try:
+        import elevation  # type: ignore
+    except ImportError:
+        print("  [info] Optional package 'elevation' not installed; skipping SRTM download.")
+        return None
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    minx, miny, maxx, maxy = bounds
+    margin = 0.05
+    bb = (minx - margin, miny - margin, maxx + margin, maxy + margin)
+    try:
+        print(f"  Downloading SRTM for bbox {bb} ...")
+        elevation.clip(bounds=bb, output=str(dest), product="SRTM3")
+        elevation.clean()
+        if dest.exists():
+            return dest
+    except Exception as exc:
+        print(f"  [warn] SRTM download failed: {exc}")
+    return None
+
+
+def make_synthetic_dem(
+    bounds: Tuple[float, float, float, float],
+    shape: Tuple[int, int] = (400, 400),
+) -> Tuple[np.ndarray, rasterio.Affine]:
+    """
+    Deterministic synthetic DEM for pipeline tests when no DEM is available.
+
+    Not suitable for operational screening.
+    """
+    minx, miny, maxx, maxy = bounds
+    h, w = shape
+    xs = np.linspace(minx, maxx, w)
+    ys = np.linspace(maxy, miny, h)
+    xx, yy = np.meshgrid(xs, ys)
+    dem = 500 + 80 * np.sin((xx - minx) * 3) + 40 * np.cos((yy - miny) * 2)
+    dem += np.random.default_rng(42).normal(0, 5, size=dem.shape)
+    transform = rio_transform.from_bounds(minx, miny, maxx, maxy, w, h)
+    return dem.astype(np.float64), transform
+
+
+# ---------------------------------------------------------------------------
+# Core screening
+# ---------------------------------------------------------------------------
+
+def build_risk_layers(
+    bounds: Tuple[float, float, float, float],
+    dem_path: Optional[Path] = None,
+    water_path: Optional[Path] = None,
+    rain_path: Optional[Path] = None,
+    weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Build driver rasters and the composite susceptibility surface over bounds."""
+    w = weights or DEFAULT_WEIGHTS
+    dem_source = "synthetic"
+
+    if dem_path and Path(dem_path).exists():
+        print(f"  Reading DEM: {dem_path}")
+        dem_arr, transform = read_raster_window(Path(dem_path), bounds)
+        dem_source = str(dem_path)
+    else:
+        srtm = try_download_srtm(bounds, Path("cache_srtm_clip.tif"))
+        if srtm and srtm.exists():
+            dem_arr, transform = read_raster_window(srtm, bounds)
+            dem_source = "SRTM3 (elevation package)"
+        else:
+            print("  [demo] No DEM supplied; using synthetic surface for testing only.")
+            dem_arr, transform = make_synthetic_dem(bounds)
+            dem_source = "synthetic (demo)"
+
+    dem_arr = np.where((dem_arr < -100) | (dem_arr > 9000), np.nan, dem_arr)
+    slope_arr = slope_from_dem(dem_arr, transform)
+
+    if water_path and Path(water_path).exists():
+        water, _ = read_raster_window(Path(water_path), bounds)
+        from scipy.ndimage import distance_transform_edt
+
+        inv = (water <= 0).astype(np.uint8)
+        dist_px = distance_transform_edt(inv)
+        px = abs(transform.a)
+        scale = px * 111_320 if px < 0.1 else px
+        dist_arr = dist_px * scale
+    elif ndimage is not None:
+        focal_min = ndimage.minimum_filter(
+            np.nan_to_num(dem_arr, nan=np.nanmax(dem_arr)), size=15
+        )
+        dist_arr = np.clip(dem_arr - focal_min, 0, None)
+    else:
+        dist_arr = np.zeros_like(dem_arr)
+
+    if rain_path and Path(rain_path).exists():
+        rain_arr, _ = read_raster_window(Path(rain_path), bounds)
+    else:
+        rain_arr = np.full_like(dem_arr, 80.0)
+
+    dem_r = adaptive_unit_scale(dem_arr, invert=True)
+    slope_r = adaptive_unit_scale(slope_arr, invert=True)
+    dist_r = adaptive_unit_scale(dist_arr, invert=True)
+    precip_r = adaptive_unit_scale(rain_arr, invert=False)
+    lulc_r = np.full_like(dem_arr, 5.0)
+
+    risk = (
+        precip_r * w["precip"]
+        + dist_r * w["dist_water"]
+        + lulc_r * w["lulc"]
+        + slope_r * w["slope"]
+        + dem_r * w["dem"]
+    )
+    risk = np.clip(risk, 1.0, 10.0)
+
+    return {
+        "risk": risk,
+        "dem_arr": dem_arr,
+        "slope_arr": slope_arr,
+        "dist_arr": dist_arr,
+        "rain_arr": rain_arr,
+        "transform": transform,
+        "bounds": bounds,
+        "dem_source": dem_source,
+    }
+
+
+def score_segments(
+    segments: gpd.GeoDataFrame,
+    layers: Dict[str, Any],
+    corridor_half_width_m: float = CORRIDOR_HALF_WIDTH_M,
+) -> List[Dict[str, Any]]:
+    """Sample drivers under each segment corridor and compute scores."""
+    metric_segs = to_metric_crs(segments)
+    transform = layers["transform"]
+    scored: List[Dict[str, Any]] = []
+
+    for i, (_, row) in enumerate(segments.iterrows()):
+        geom = row.geometry
+        mrow = metric_segs.iloc[i]
+        buf = mrow.geometry.buffer(corridor_half_width_m)
+        buf_wgs = gpd.GeoSeries([buf], crs=metric_segs.crs).to_crs(epsg=4326).iloc[0]
+
+        base = zonal_mean(buf_wgs, layers["risk"], transform)
+        dem_m = zonal_mean(buf_wgs, layers["dem_arr"], transform)
+        slope_m = zonal_mean(buf_wgs, layers["slope_arr"], transform)
+        dist_m = zonal_mean(buf_wgs, layers["dist_arr"], transform)
+        rain_m = zonal_mean(buf_wgs, layers["rain_arr"], transform)
+
+        if base is None:
+            base = 5.0
+        final = float(np.clip(base, 1.0, 10.0))
+        cat = score_to_rozvi_category(final)
+        band = rozvi_band(cat)
+        cen = geom.centroid if geom and not geom.is_empty else None
+
+        scored.append(
+            {
+                "uid": f"R-{i + 1:04d}",
+                "road_id": row.get("road_id", i),
+                "seg_index": int(row.get("seg_index", i)),
+                "geometry": geom,
+                "base_risk": round(final, 2),
+                "road_score": round(final, 2),
+                "final_score": round(final, 2),
+                "category": risk_category_legacy(final),
+                "risk_category_0_100": cat,
+                "band": band,
+                "relative_risk_score": relative_risk_score_from_category(cat),
+                "dominant_peril": "pluvial",
+                "elev_m": None if dem_m is None else round(dem_m, 1),
+                "slope_deg": None if slope_m is None else round(slope_m, 2),
+                "dist_water_proxy_m": None if dist_m is None else round(dist_m, 1),
+                "forecast_rain_mm": None if rain_m is None else round(rain_m, 1),
+                "lon": None if cen is None else round(cen.x, 6),
+                "lat": None if cen is None else round(cen.y, 6),
+                "length_m": float(row.get("length_m", SEGMENT_LENGTH_M)),
+                "depth_100_undef_m": None,
+                "eal_present": None,
+                "eal_future": None,
+            }
+        )
+    return scored
+
+
+def assign_chainage(scored: List[Dict], seg_len: float) -> List[Dict]:
+    """Assign sequential chainage and section IDs per parent road feature."""
+    by_road: Dict[str, List] = defaultdict(list)
+    for s in scored:
+        by_road[str(s["road_id"])].append(s)
+    for rid, segs in by_road.items():
+        segs.sort(key=lambda x: x["seg_index"])
+        chain = 0.0
+        for i, s in enumerate(segs):
+            s["chainage_start_m"] = round(chain, 1)
+            s["chainage_end_m"] = round(chain + seg_len, 1)
+            s["chainage_mid_m"] = round(chain + seg_len / 2.0, 1)
+            s["section_id"] = f"{rid}-{i + 1:03d}"
+            s["asset_id"] = s["section_id"]
+            s["asset_name"] = f"Road segment {s['section_id']}"
+            s["asset_type"] = "road_segment"
+            chain = s["chainage_end_m"]
+    ranked = sorted(scored, key=lambda x: x["risk_category_0_100"], reverse=True)
+    for rank, s in enumerate(ranked, start=1):
+        s["rank"] = rank
+    return scored
+
+
+def portfolio_metrics(scored: List[Dict], seg_len: float) -> Dict[str, Any]:
+    n = len(scored)
+    total_km = n * seg_len / 1000.0
+    exposed = sum(1 for s in scored if s["final_score"] >= SCREENING_THRESHOLD)
+    band_counts = {name: 0 for name, _, _ in RISK_BANDS}
+    for s in scored:
+        band_counts[s["band"]] = band_counts.get(s["band"], 0) + 1
+    cats = [s["risk_category_0_100"] for s in scored]
+    top = max(scored, key=lambda x: x["risk_category_0_100"]) if scored else None
+    return {
+        "asset_count": n,
+        "road_length_km": round(total_km, 2),
+        "n_assets_exposed_screening": exposed,
+        "pct_assets_exposed_screening": round(exposed / n * 100, 1) if n else 0,
+        "portfolio_mean_category": round(float(np.mean(cats)), 1) if cats else 0.0,
+        "top_asset_name": top["asset_name"] if top else None,
+        "top_asset_id": top["asset_id"] if top else None,
+        "top_asset_category_score": top["risk_category_0_100"] if top else None,
+        "band_counts": band_counts,
+        "dominant_peril": "pluvial",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Exports
+# ---------------------------------------------------------------------------
+
+def export_executive_summary(
+    scored: List[Dict], seg_len: float, metrics: Dict[str, Any], out_dir: Path
+) -> Path:
+    top = sorted(scored, key=lambda x: x["final_score"], reverse=True)[:5]
+    top_ids = "; ".join(s["section_id"] for s in top)
+    n = metrics["asset_count"]
+    total_km = metrics["road_length_km"]
+    exposed_km = metrics["n_assets_exposed_screening"] * seg_len / 1000.0
+
+    row = {
+        "report_title": f"{MODEL_NAME} – Executive Summary",
+        "report_id": f"RFM-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}",
+        "report_type": "Portfolio (road segments as assets)",
+        "generated_on": datetime.now().isoformat(timespec="seconds"),
+        "model_version": MODEL_VERSION,
+        "asset_count": n,
+        "road_length_assessed_km": total_km,
+        "baseline_exposed_length_km": round(exposed_km, 1),
+        "baseline_exposed_pct": metrics["pct_assets_exposed_screening"],
+        "portfolio_mean_category": metrics["portfolio_mean_category"],
+        "top_asset_name": metrics["top_asset_name"],
+        "top_asset_category_score": metrics["top_asset_category_score"],
+        "dominant_peril": metrics["dominant_peril"],
+        "priority_locations": top_ids,
+        "exposure_definition": (
+            f"Segments with susceptibility score >= {SCREENING_THRESHOLD}. "
+            "Risk category 0-100 is a linear map of the 1-10 score. "
+            "Not a calibrated return-period probability or depth product."
+        ),
+        "plain_language_summary": (
+            f"Approximately {total_km:.1f} km ({n} segments) assessed. "
+            f"{metrics['pct_assets_exposed_screening']}% meet the screening threshold. "
+            f"Mean risk category = {metrics['portfolio_mean_category']}/100. "
+            f"Highest segment: {metrics['top_asset_name']} "
+            f"(category {metrics['top_asset_category_score']}). "
+            f"Priority sections: {top_ids}."
+        ),
+        "important_caveats": (
+            "Screening ranking only. No AEP depth grids, defence scenarios, "
+            "climate depth adjustment, or EAL/PML in this build."
+        ),
+    }
+    path = out_dir / f"Executive_Summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    pd.DataFrame([row]).to_csv(path, index=False)
+    print(f"  Wrote {path}")
+    return path
+
+
+def export_section_register(scored: List[Dict], seg_len: float, out_dir: Path) -> Path:
+    rows = []
+    for s in scored:
+        rows.append(
+            {
+                "section_id": s.get("section_id"),
+                "asset_id": s.get("asset_id"),
+                "road_id": s["road_id"],
+                "segment_index": s["seg_index"],
+                "chainage_start_m": s.get("chainage_start_m"),
+                "chainage_end_m": s.get("chainage_end_m"),
+                "chainage_mid_m": s.get("chainage_mid_m"),
+                "approx_length_m": seg_len,
+                "length_m": s.get("length_m"),
+                "lon": s.get("lon"),
+                "lat": s.get("lat"),
+                "final_risk_score": s["final_score"],
+                "risk_category_legacy": s["category"],
+                "risk_category_0_100": s["risk_category_0_100"],
+                "band": s["band"],
+                "relative_risk_score": s["relative_risk_score"],
+                "rank": s.get("rank"),
+                "dominant_peril": s["dominant_peril"],
+                "elev_m": s.get("elev_m"),
+                "slope_deg": s.get("slope_deg"),
+                "dist_water_proxy_m": s.get("dist_water_proxy_m"),
+                "forecast_rain_mm": s.get("forecast_rain_mm"),
+                "depth_100_undef_m": None,
+                "eal_present": None,
+                "result_state": "Modelled susceptibility (no calibrated AEP or depth)",
+                "follow_up": "Inspect drainage and embankment if High or Extreme band",
+            }
+        )
+    path = out_dir / f"Road_Section_Exposure_Register_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"  Wrote {path}")
+    return path
+
+
+def export_asset_scores(scored: List[Dict], out_dir: Path) -> Path:
+    rows = [
+        {
+            "rank": s.get("rank"),
+            "asset_id": s.get("asset_id"),
+            "asset_name": s.get("asset_name"),
+            "lat": s.get("lat"),
+            "lon": s.get("lon"),
+            "asset_type": s.get("asset_type"),
+            "chainage_start_m": s.get("chainage_start_m"),
+            "chainage_end_m": s.get("chainage_end_m"),
+            "chainage_mid_m": s.get("chainage_mid_m"),
+            "elev_m": s.get("elev_m"),
+            "slope_deg": s.get("slope_deg"),
+            "dist_water_proxy_m": s.get("dist_water_proxy_m"),
+            "relative_risk_score": s["relative_risk_score"],
+            "risk_category": s["risk_category_0_100"],
+            "band": s["band"],
+            "dominant_peril": s["dominant_peril"],
+            "susceptibility_score_1_10": s["final_score"],
+            "depth_100_undef": None,
+            "eal_present": None,
+            "horizon": "present",
+            "scenario": "baseline",
+        }
+        for s in scored
+    ]
+    path = out_dir / f"Rozvi_Asset_Scores_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"  Wrote {path}")
+    return path
+
+
+def export_payload(
+    scored: List[Dict],
+    metrics: Dict[str, Any],
+    layers: Dict[str, Any],
+    seg_len: float,
+    out_dir: Path,
+    portfolio_name: str,
+) -> Path:
+    """JSON payload aligned to report placeholders for downstream systems."""
+    bc = metrics["band_counts"]
+    n = metrics["asset_count"]
+    payload = {
+        "model_name": MODEL_NAME,
+        "model_version": MODEL_VERSION,
+        "portfolio_name": portfolio_name,
+        "run_date": datetime.now().strftime("%Y-%m-%d"),
+        "asset_count": n,
+        "road_length_km": metrics["road_length_km"],
+        "segment_length_m": seg_len,
+        "dem_source": layers.get("dem_source"),
+        "crs": "EPSG:4326",
+        "portfolio_mean_category": metrics["portfolio_mean_category"],
+        "pct_assets_exposed_screening": metrics["pct_assets_exposed_screening"],
+        "top_asset_name": metrics["top_asset_name"],
+        "top_asset_category_score": metrics["top_asset_category_score"],
+        "dominant_peril": metrics["dominant_peril"],
+        "band_counts": bc,
+        "assets": [
+            {
+                "asset_id": s["asset_id"],
+                "section_id": s.get("section_id"),
+                "lat": s["lat"],
+                "lon": s["lon"],
+                "chainage_start_m": s.get("chainage_start_m"),
+                "chainage_end_m": s.get("chainage_end_m"),
+                "elev_m": s.get("elev_m"),
+                "slope_deg": s.get("slope_deg"),
+                "susceptibility_1_10": s["final_score"],
+                "risk_category": s["risk_category_0_100"],
+                "band": s["band"],
+                "relative_risk_score": s["relative_risk_score"],
+                "rank": s.get("rank"),
+            }
+            for s in scored
+        ],
+    }
+    path = out_dir / f"Rozvi_Report_Payload_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"  Wrote {path}")
+    return path
+
+
+def export_geojson(scored: List[Dict], out_dir: Path) -> Optional[Path]:
+    try:
+        gdf = gpd.GeoDataFrame(scored, geometry="geometry", crs="EPSG:4326")
+        path = out_dir / f"Road_Segments_Scored_{datetime.now().strftime('%Y%m%d_%H%M%S')}.geojson"
+        gdf.to_file(path, driver="GeoJSON")
+        print(f"  Wrote {path}")
+        return path
+    except Exception as exc:
+        print(f"  [warn] GeoJSON export failed: {exc}")
+        return None
+
+
+def _shade(cell, hex_color: str) -> None:
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:fill"), hex_color)
+    shd.set(qn("w:val"), "clear")
+    cell._tc.get_or_add_tcPr().append(shd)
+
+
+def _hdr(row, color: str = "1F4E79") -> None:
+    for cell in row.cells:
+        _shade(cell, color)
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.bold = True
+                r.font.color.rgb = RGBColor(255, 255, 255)
+                r.font.size = Pt(9)
+                r.font.name = "Arial"
+
+
+def _font_row(row, size: int = 9) -> None:
+    for cell in row.cells:
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.name = "Arial"
+                r.font.size = Pt(size)
+
+
+def generate_docx_report(
+    scored: List[Dict],
+    metrics: Dict[str, Any],
+    layers: Dict[str, Any],
+    seg_len: float,
+    out_dir: Path,
+    portfolio_name: str,
+) -> Optional[Path]:
+    if not HAS_DOCX:
+        print("  [info] python-docx not installed; skipping Word report.")
+        return None
+
+    doc = Document()
+    section = doc.sections[0]
+    section.left_margin = Inches(0.9)
+    section.right_margin = Inches(0.9)
+
+    def heading(text: str, level: int = 1) -> None:
+        h = doc.add_heading(text, level=level)
+        for r in h.runs:
+            r.font.name = "Arial"
+            r.font.color.rgb = RGBColor(31, 78, 121)
+
+    def para(text: str, size: int = 10, italic: bool = False) -> None:
+        p = doc.add_paragraph()
+        r = p.add_run(text)
+        r.font.name = "Arial"
+        r.font.size = Pt(size)
+        r.italic = italic
+        p.paragraph_format.space_after = Pt(6)
+
+    n = metrics["asset_count"]
+    bc = metrics["band_counts"]
+
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run(MODEL_NAME)
+    run.bold = True
+    run.font.size = Pt(18)
+    run.font.color.rgb = RGBColor(31, 78, 121)
+    run.font.name = "Arial"
+    para(portfolio_name, size=12)
+    para(
+        "Auto-generated screening report. Flood depth, EAL and return-period hazard "
+        "grids are not assessed in this build.",
+        size=9,
+        italic=True,
+    )
+
+    heading("0. Report metadata")
+    meta = [
+        ("Report title", f"Flood Risk Report – {portfolio_name}"),
+        ("Model", f"{MODEL_NAME} {MODEL_VERSION}"),
+        ("DEM source", str(layers.get("dem_source"))),
+        ("Run date", datetime.now().strftime("%Y-%m-%d %H:%M")),
+        ("Assets assessed", str(n)),
+        ("Road length (km)", str(metrics["road_length_km"])),
+        ("Segment length (m)", str(seg_len)),
+        ("CRS", "EPSG:4326"),
+    ]
+    tbl = doc.add_table(rows=len(meta), cols=2)
+    tbl.style = "Table Grid"
+    for i, (a, b) in enumerate(meta):
+        tbl.rows[i].cells[0].text = a
+        tbl.rows[i].cells[1].text = b
+        _font_row(tbl.rows[i])
+        tbl.rows[i].cells[0].paragraphs[0].runs[0].bold = True
+        _shade(tbl.rows[i].cells[0], "D6E3F0")
+
+    heading("1. Executive summary")
+    heading("1.1 Headline metrics", 2)
+    head = [
+        ("Metric", "Value"),
+        (
+            f"Assets at screening threshold (score >= {SCREENING_THRESHOLD})",
+            f"{metrics['n_assets_exposed_screening']} of {n} ({metrics['pct_assets_exposed_screening']}%)",
+        ),
+        (
+            "Highest-risk segment",
+            f"{metrics['top_asset_name']} (category {metrics['top_asset_category_score']})",
+        ),
+        ("Mean risk category (0-100)", str(metrics["portfolio_mean_category"])),
+        ("Dominant peril", metrics["dominant_peril"]),
+        ("EAL / 1-in-100 depth", "not assessed"),
+    ]
+    ht = doc.add_table(rows=len(head), cols=2)
+    ht.style = "Table Grid"
+    for i, (a, b) in enumerate(head):
+        ht.rows[i].cells[0].text = a
+        ht.rows[i].cells[1].text = b
+        _font_row(ht.rows[i])
+    _hdr(ht.rows[0])
+
+    heading("1.2 Risk distribution", 2)
+    dist = [("Band", "Range", "Count", "%")]
+    for name, lo, hi in RISK_BANDS:
+        c = bc.get(name, 0)
+        dist.append((name, f"{lo}–{hi}", str(c), f"{round(c / n * 100, 1) if n else 0}%"))
+    dt = doc.add_table(rows=len(dist), cols=4)
+    dt.style = "Table Grid"
+    for i, row in enumerate(dist):
+        for j, val in enumerate(row):
+            dt.rows[i].cells[j].text = val
+        _font_row(dt.rows[i])
+    _hdr(dt.rows[0])
+
+    heading("2. Method")
+    para(
+        "Susceptibility is a weighted combination of precipitation, proximity to water "
+        "(or height above local terrain minima), land cover (neutral when absent), "
+        "slope and elevation. Drivers are scaled to 1-10 with AOI percentile stretches. "
+        "Segment scores are corridor zonal means."
+    )
+    para(f"DEM source: {layers.get('dem_source')}.")
+    para(
+        "Return-period depths, defended/undefended cases, climate pathways and financial "
+        "loss are outside the scope of this screening build.",
+        size=9,
+        italic=True,
+    )
+
+    heading("3. Priority segments")
+    top15 = sorted(scored, key=lambda x: x["risk_category_0_100"], reverse=True)[:15]
+    cols = ["Rank", "Section", "Chainage (m)", "Lat", "Lon", "Elev", "Slope", "Score", "Cat", "Band"]
+    mt = doc.add_table(rows=1 + len(top15), cols=len(cols))
+    mt.style = "Table Grid"
+    for j, c in enumerate(cols):
+        mt.rows[0].cells[j].text = c
+    _hdr(mt.rows[0])
+    for i, s in enumerate(top15):
+        vals = [
+            str(s.get("rank")),
+            str(s.get("section_id")),
+            f"{s.get('chainage_start_m')}–{s.get('chainage_end_m')}",
+            str(s.get("lat")),
+            str(s.get("lon")),
+            str(s.get("elev_m")),
+            str(s.get("slope_deg")),
+            str(s.get("final_score")),
+            str(s.get("risk_category_0_100")),
+            str(s.get("band")),
+        ]
+        for j, v in enumerate(vals):
+            mt.rows[i + 1].cells[j].text = v
+        _font_row(mt.rows[i + 1], size=8)
+
+    heading("4. Segment and chainage fields")
+    para(
+        f"Network divided into {n} segments of nominal length {seg_len} m. "
+        "Chainage is sequential from the first vertex of each parent road feature."
+    )
+
+    heading("5. Limitations")
+    for line in [
+        "Outputs are relative susceptibility rankings, not calibrated probabilities or depths.",
+        "No return-period depth grids, defence performance, or climate depth adjustment.",
+        "Coarse DEM sources cannot resolve low embankments or bridge decks.",
+        "Chainage origin is model-derived unless replaced with official alignment data.",
+        "Missing raster samples default toward a neutral susceptibility contribution.",
+    ]:
+        para(f"• {line}")
+
+    path = out_dir / f"Flood_Risk_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+    doc.save(str(path))
+    print(f"  Wrote {path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=f"{MODEL_NAME} – corridor flood susceptibility screening"
+    )
+    p.add_argument("--roads", required=True, help="Road network GeoJSON or Shapefile")
+    p.add_argument("--dem", default=None, help="Optional DEM GeoTIFF (recommended)")
+    p.add_argument("--water", default=None, help="Optional water-mask GeoTIFF")
+    p.add_argument("--rain", default=None, help="Optional rainfall GeoTIFF (mm)")
+    p.add_argument("--seg-length", type=float, default=SEGMENT_LENGTH_M)
+    p.add_argument("--corridor", type=float, default=CORRIDOR_HALF_WIDTH_M)
+    p.add_argument("--max-segments", type=int, default=MAX_SEGMENTS)
+    p.add_argument("--outdir", default="./outputs")
+    p.add_argument("--portfolio-name", default="Road corridor portfolio")
+    p.add_argument("--no-docx", action="store_true", help="Skip Word report")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    out_dir = Path(args.outdir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print(f"{MODEL_NAME}  v{MODEL_VERSION}")
+    print("=" * 70)
+
+    roads_path = Path(args.roads)
+    if not roads_path.exists():
+        print(f"ERROR: road file not found: {roads_path}")
+        return 1
+
+    print(f"\n[1/6] Loading roads: {roads_path}")
+    roads = ensure_wgs84(gpd.read_file(roads_path))
+    roads = roads[roads.geometry.type.isin(["LineString", "MultiLineString"])].copy()
+    if roads.empty:
+        print("ERROR: no LineString / MultiLineString features.")
+        return 1
+    print(f"  {len(roads)} line feature(s)")
+
+    print(f"\n[2/6] Segmenting (~{args.seg_length:.0f} m) ...")
+    segments = segment_roads(roads, seg_len_m=args.seg_length, max_segments=args.max_segments)
+    print(f"  {len(segments)} segments")
+
+    minx, miny, maxx, maxy = segments.total_bounds
+    pad = 0.02
+    bounds = (minx - pad, miny - pad, maxx + pad, maxy + pad)
+    print(f"\n[3/6] Building risk layers {tuple(round(b, 4) for b in bounds)}")
+    layers = build_risk_layers(
+        bounds,
+        dem_path=Path(args.dem) if args.dem else None,
+        water_path=Path(args.water) if args.water else None,
+        rain_path=Path(args.rain) if args.rain else None,
+    )
+
+    print(f"\n[4/6] Scoring segments ...")
+    scored = score_segments(segments, layers, corridor_half_width_m=args.corridor)
+    scored = assign_chainage(scored, args.seg_length)
+    metrics = portfolio_metrics(scored, args.seg_length)
+    print("  Band counts:", metrics["band_counts"])
+
+    print(f"\n[5/6] Writing outputs -> {out_dir.resolve()}")
+    export_executive_summary(scored, args.seg_length, metrics, out_dir)
+    export_section_register(scored, args.seg_length, out_dir)
+    export_asset_scores(scored, out_dir)
+    export_payload(scored, metrics, layers, args.seg_length, out_dir, args.portfolio_name)
+    export_geojson(scored, out_dir)
+
+    print("\n[6/6] Report")
+    if not args.no_docx:
+        generate_docx_report(
+            scored, metrics, layers, args.seg_length, out_dir, args.portfolio_name
+        )
+
+    print("\nComplete.")
+    print(
+        "Note: results are susceptibility rankings for screening. "
+        "They are not calibrated flood probabilities or water-depth estimates."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

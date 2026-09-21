@@ -1,0 +1,16 @@
+name: rozvi-flood
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - geopandas
+  - rasterio
+  - numpy
+  - pandas
+  - shapely
+  - scipy
+  - pyproj
+  - pip
+  - pip:
+      - python-docx>=1.0
