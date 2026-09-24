@@ -91,7 +91,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "Rozvi Flood Model"
-MODEL_VERSION = "1.3.0"
+MODEL_VERSION = "1.4.1"
 
 # Driver weights (must sum to 1.0). Applied after each driver is scaled to 1-10.
 DEFAULT_WEIGHTS = {
@@ -146,7 +146,34 @@ DRIVER_CATALOGUE = [
     },
 ]
 
+
 SCREENING_THRESHOLD = 7.0
+
+# ESA WorldCover class codes -> susceptibility (1-10). Used when --lulc is supplied.
+WORLDCOVER_TO_SUSCEPTIBILITY = {
+    10: 3.0,   # Tree cover
+    20: 4.0,   # Shrubland
+    30: 5.0,   # Grassland
+    40: 6.0,   # Cropland
+    50: 7.5,   # Built-up
+    60: 5.5,   # Bare / sparse vegetation
+    70: 2.0,   # Snow and ice
+    80: 9.5,   # Permanent water bodies
+    90: 8.5,   # Herbaceous wetland
+    95: 8.0,   # Mangroves
+    100: 4.0,  # Moss and lichen
+}
+
+
+def lulc_classes_to_risk(lulc: np.ndarray) -> np.ndarray:
+    """Map categorical land-cover codes to a 1-10 susceptibility surface."""
+    out = np.full(lulc.shape, 5.0, dtype=np.float64)
+    for code, score in WORLDCOVER_TO_SUSCEPTIBILITY.items():
+        out[lulc == code] = score
+    out[~np.isfinite(lulc.astype(float))] = 5.0
+    out[lulc == 0] = 5.0
+    return np.clip(out, 1.0, 10.0)
+
 SEGMENT_LENGTH_M = 100.0
 CORRIDOR_HALF_WIDTH_M = 15.0
 MAX_SEGMENTS = 5000
@@ -439,6 +466,34 @@ def adaptive_unit_scale(
     return np.clip(risk, 1.0, 10.0)
 
 
+
+def resample_to_grid(
+    src_arr: np.ndarray,
+    src_transform: rasterio.Affine,
+    dst_shape: Tuple[int, int],
+    dst_transform: rasterio.Affine,
+    resampling: "Resampling" = None,
+) -> np.ndarray:
+    """Reproject/resample an array onto the DEM grid."""
+    if resampling is None:
+        resampling = Resampling.bilinear
+    if src_arr.shape == dst_shape:
+        return src_arr.astype(np.float64)
+    dest = np.full(dst_shape, np.nan, dtype=np.float64)
+    reproject(
+        source=src_arr.astype(np.float64),
+        destination=dest,
+        src_transform=src_transform,
+        src_crs="EPSG:4326",
+        dst_transform=dst_transform,
+        dst_crs="EPSG:4326",
+        resampling=resampling,
+        src_nodata=np.nan,
+        dst_nodata=np.nan,
+    )
+    return dest
+
+
 def try_download_srtm(bounds: Tuple[float, float, float, float], dest: Path) -> Optional[Path]:
     """Optional public SRTM clip via the elevation package."""
     try:
@@ -491,6 +546,7 @@ def build_risk_layers(
     dem_path: Optional[Path] = None,
     water_path: Optional[Path] = None,
     rain_path: Optional[Path] = None,
+    lulc_path: Optional[Path] = None,
     weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Build driver rasters and the composite susceptibility surface over bounds."""
@@ -520,10 +576,13 @@ def build_risk_layers(
     slope_arr = slope_from_dem(dem_arr, transform)
 
     if water_path and Path(water_path).exists():
-        water, _ = read_raster_window(Path(water_path), bounds)
+        water_raw, water_tf = read_raster_window(Path(water_path), bounds)
+        water = resample_to_grid(
+            water_raw, water_tf, dem_arr.shape, transform, Resampling.nearest
+        )
         from scipy.ndimage import distance_transform_edt
 
-        inv = (water <= 0).astype(np.uint8)
+        inv = (np.nan_to_num(water, nan=0) <= 0).astype(np.uint8)
         dist_px = distance_transform_edt(inv)
         px = abs(transform.a)
         scale = px * 111_320 if px < 0.1 else px
@@ -538,16 +597,32 @@ def build_risk_layers(
         dist_arr = np.zeros_like(dem_arr)
 
     if rain_path and Path(rain_path).exists():
-        rain_arr, _ = read_raster_window(Path(rain_path), bounds)
+        rain_raw, rain_tf = read_raster_window(Path(rain_path), bounds)
+        rain_arr = resample_to_grid(
+            rain_raw, rain_tf, dem_arr.shape, transform, Resampling.bilinear
+        )
         rain_source = str(rain_path)
+        print(f"  Rain resampled to DEM grid: {rain_arr.shape}")
     else:
         rain_arr = np.full_like(dem_arr, 80.0)
+
+    lulc_source = "neutral default (no land-cover raster)"
+    if lulc_path and Path(lulc_path).exists():
+        print(f"  Reading LULC: {lulc_path}")
+        lulc_raw, lulc_tf = read_raster_window(Path(lulc_path), bounds)
+        lulc_raw = resample_to_grid(
+            lulc_raw, lulc_tf, dem_arr.shape, transform, Resampling.nearest
+        )
+        lulc_r = lulc_classes_to_risk(lulc_raw)
+        lulc_source = str(lulc_path)
+        print(f"  LULC resampled to DEM grid: {lulc_r.shape}")
+    else:
+        lulc_r = np.full_like(dem_arr, 5.0)
 
     dem_r = adaptive_unit_scale(dem_arr, invert=True)
     slope_r = adaptive_unit_scale(slope_arr, invert=True)
     dist_r = adaptive_unit_scale(dist_arr, invert=True)
     precip_r = adaptive_unit_scale(rain_arr, invert=False)
-    lulc_r = np.full_like(dem_arr, 5.0)
 
     risk = (
         precip_r * w["precip"]
@@ -571,6 +646,8 @@ def build_risk_layers(
             entry["data_status"] = dem_source
         elif d["key"] == "slope":
             entry["data_status"] = f"Derived from DEM ({dem_source})"
+        elif d["key"] == "lulc":
+            entry["data_status"] = lulc_source
         catalogue.append(entry)
 
     return {
@@ -590,6 +667,7 @@ def build_risk_layers(
         "dem_source": dem_source,
         "rain_source": rain_source,
         "water_source": water_source,
+        "lulc_source": lulc_source,
         "weights": w,
         "driver_catalogue": catalogue,
     }
@@ -1519,7 +1597,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--roads", required=True, help="Road network GeoJSON or Shapefile")
     p.add_argument("--dem", default=None, help="Optional DEM GeoTIFF (recommended)")
     p.add_argument("--water", default=None, help="Optional water-mask GeoTIFF")
-    p.add_argument("--rain", default=None, help="Optional rainfall GeoTIFF (mm)")
+    p.add_argument("--rain", default=None, help="Optional rainfall GeoTIFF (mm), e.g. CHIRPS clip")
+    p.add_argument("--lulc", default=None, help="Optional land-cover GeoTIFF (e.g. ESA WorldCover)")
     p.add_argument("--seg-length", type=float, default=SEGMENT_LENGTH_M)
     p.add_argument("--corridor", type=float, default=CORRIDOR_HALF_WIDTH_M)
     p.add_argument("--max-segments", type=int, default=MAX_SEGMENTS)
@@ -1564,6 +1643,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         dem_path=Path(args.dem) if args.dem else None,
         water_path=Path(args.water) if args.water else None,
         rain_path=Path(args.rain) if args.rain else None,
+        lulc_path=Path(args.lulc) if args.lulc else None,
     )
     print("  Driver weights:", layers["weights"])
 
