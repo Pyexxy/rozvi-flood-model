@@ -29,3 +29,11 @@ Thumbs.db
 .env
 *.key
 credentials*
+
+*.zip
+
+*.ovr
+
+*.tif
+
+*.TIF
