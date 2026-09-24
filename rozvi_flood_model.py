@@ -9,10 +9,13 @@ The model scores fixed-length road segments using a weighted combination of
 terrain and hydro-meteorological drivers, maps scores onto a 0-100 risk
 category scale, and writes tabular, geospatial and Word report outputs.
 
+Scope
+-----
 This is a screening tool. It does not compute return-period flood depths,
-defence performance, climate scenario depths, or financial loss (EAL/PML).
-Those fields are reported as not assessed where a full hazard engine would
-populate them.
+defence performance, climate-adjusted depth surfaces, or financial loss
+(EAL/PML). Climate information (CMIP6 / emerging CMIP7 pathways) is reported
+as regional context only. Those limitations are stated explicitly in the
+outputs so results are not misread as calibrated hazard or loss products.
 
 Usage
 -----
@@ -79,8 +82,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "Rozvi Flood Model"
-MODEL_VERSION = "1.1.0"
+MODEL_VERSION = "1.2.1"
 
+# Driver weights (must sum to 1.0). Applied after each driver is scaled to 1-10.
 DEFAULT_WEIGHTS = {
     "precip": 0.30,
     "dist_water": 0.25,
@@ -89,12 +93,55 @@ DEFAULT_WEIGHTS = {
     "dem": 0.10,
 }
 
+# Human-readable driver catalogue for reports and audit trails
+DRIVER_CATALOGUE = [
+    {
+        "key": "precip",
+        "name": "Precipitation",
+        "weight": DEFAULT_WEIGHTS["precip"],
+        "direction": "Higher rainfall increases susceptibility",
+        "data_status": "Local rainfall raster if supplied; otherwise uniform placeholder",
+        "scaling": "AOI percentile stretch (2nd-98th); not inverted",
+    },
+    {
+        "key": "dist_water",
+        "name": "Proximity to water / local low points",
+        "weight": DEFAULT_WEIGHTS["dist_water"],
+        "direction": "Greater distance (or height above local minima) reduces susceptibility",
+        "data_status": "Water mask distance if supplied; otherwise height above focal DEM minimum",
+        "scaling": "AOI percentile stretch; inverted",
+    },
+    {
+        "key": "lulc",
+        "name": "Land cover",
+        "weight": DEFAULT_WEIGHTS["lulc"],
+        "direction": "Class-dependent when a land-cover raster is available",
+        "data_status": "Neutral value (5) when no land-cover raster is supplied",
+        "scaling": "Fixed class map or neutral default",
+    },
+    {
+        "key": "slope",
+        "name": "Terrain slope",
+        "weight": DEFAULT_WEIGHTS["slope"],
+        "direction": "Steeper slopes reduce ponding susceptibility in this formulation",
+        "data_status": "Derived from DEM",
+        "scaling": "AOI percentile stretch; inverted",
+    },
+    {
+        "key": "dem",
+        "name": "Elevation",
+        "weight": DEFAULT_WEIGHTS["dem"],
+        "direction": "Higher elevation reduces susceptibility",
+        "data_status": "DEM GeoTIFF, optional public SRTM, or synthetic test surface",
+        "scaling": "AOI percentile stretch; inverted",
+    },
+]
+
 SCREENING_THRESHOLD = 7.0
 SEGMENT_LENGTH_M = 100.0
 CORRIDOR_HALF_WIDTH_M = 15.0
 MAX_SEGMENTS = 5000
 
-# Risk category bands on the 0-100 scale
 RISK_BANDS = [
     ("Minimal", 0, 10),
     ("Low", 11, 30),
@@ -103,9 +150,47 @@ RISK_BANDS = [
     ("Extreme", 86, 100),
 ]
 
+# Climate context (documentary only in this build)
+CLIMATE_CONTEXT = {
+    "framework": "CMIP6 (CMIP7 not yet used operationally in this screening build)",
+    "pathways_referenced": "SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5 (for narrative context)",
+    "application": (
+        "Regional seasonal anomaly context only. No segment-scale depth or "
+        "probability adjustment is applied from CMIP outputs in this version."
+    ),
+    "cmip7_note": (
+        "CMIP7 is the next generation of the Coupled Model Intercomparison Project. "
+        "As of this model version, screening reports reference CMIP6 pathways for "
+        "context. CMIP7-based regional products may be adopted in a later release "
+        "once stable, peer-reviewed downscaled datasets are available for the study region."
+    ),
+    "segment_scale_climate": "not assessed",
+}
+
+# Model quality / assurance statements for reports
+MODEL_QUALITY = {
+    "purpose": "Relative susceptibility ranking for corridor screening and prioritisation",
+    "calibration_status": "Not calibrated against observed road closures or gauged flood peaks",
+    "validation_status": (
+        "No independent closure or inundation validation in the default workflow. "
+        "Users should document any project-specific checks separately."
+    ),
+    "spatial_unit": "Fixed-length road segments with corridor buffer sampling",
+    "vertical_data_limit": (
+        "DEM resolution (e.g. SRTM ~30 m) cannot resolve embankments or structures "
+        "below approximately 2-3 m."
+    ),
+    "missing_data_policy": "Unsampled or missing driver pixels contribute a neutral score of 5 before weighting",
+    "suitable_uses": "Prioritisation of inspection, further study, and data collection",
+    "unsuitable_uses": (
+        "Design water levels, formal flood zoning, insurance pricing, or statements of "
+        "absolute flood probability without additional calibrated modelling"
+    ),
+}
+
 
 def risk_category_legacy(score: Optional[float]) -> str:
-    """Four-class label used in earlier corridor screening reports."""
+    """Four-class label retained for continuity with earlier corridor reports."""
     if score is None or (isinstance(score, float) and math.isnan(score)):
         return "N/A"
     if score <= 3:
@@ -135,10 +220,14 @@ def relative_risk_score_from_category(category: int) -> int:
     """
     Relative risk on a 0-1,000,000 scale.
 
-    Implemented as category * 10,000 for local ranking. This is not normalised
-    to a national or global exposure baseline.
+    Implemented as category * 10,000 for local ranking within a run.
+    Not normalised to a national or global exposure baseline.
     """
     return int(np.clip(category, 0, 100)) * 10_000
+
+
+def weights_sum_ok(weights: Dict[str, float], tol: float = 1e-6) -> bool:
+    return abs(sum(weights.values()) - 1.0) <= tol
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +292,8 @@ def segment_roads(
     """
     Explode a road network into fixed-length segments.
 
-    Returns a GeoDataFrame in EPSG:4326 with road_id, seg_index, geometry, length_m.
+    Returns a GeoDataFrame in EPSG:4326 with columns
+    road_id, seg_index, geometry, length_m.
     """
     metric = to_metric_crs(roads_gdf)
     rows = []
@@ -280,7 +370,6 @@ def slope_from_dem(dem: np.ndarray, transform: rasterio.Affine) -> np.ndarray:
     px = abs(transform.a)
     py = abs(transform.e)
     if px < 0.1:
-        # Geographic CRS: approximate metres per degree near 20 deg latitude
         lat_m = 111_320.0
         lon_m = 111_320.0 * math.cos(math.radians(20))
         dx, dy = px * lon_m, py * lat_m
@@ -334,7 +423,7 @@ def adaptive_unit_scale(
 
 
 def try_download_srtm(bounds: Tuple[float, float, float, float], dest: Path) -> Optional[Path]:
-    """Optional public SRTM clip via the elevation package (no cloud project ID)."""
+    """Optional public SRTM clip via the elevation package."""
     try:
         import elevation  # type: ignore
     except ImportError:
@@ -388,8 +477,13 @@ def build_risk_layers(
     weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Build driver rasters and the composite susceptibility surface over bounds."""
-    w = weights or DEFAULT_WEIGHTS
+    w = dict(weights or DEFAULT_WEIGHTS)
+    if not weights_sum_ok(w):
+        print(f"  [warn] Driver weights sum to {sum(w.values()):.4f}, expected 1.0")
+
     dem_source = "synthetic"
+    rain_source = "placeholder (80 mm uniform)"
+    water_source = "HAND-like focal minimum proxy"
 
     if dem_path and Path(dem_path).exists():
         print(f"  Reading DEM: {dem_path}")
@@ -417,6 +511,7 @@ def build_risk_layers(
         px = abs(transform.a)
         scale = px * 111_320 if px < 0.1 else px
         dist_arr = dist_px * scale
+        water_source = str(water_path)
     elif ndimage is not None:
         focal_min = ndimage.minimum_filter(
             np.nan_to_num(dem_arr, nan=np.nanmax(dem_arr)), size=15
@@ -427,6 +522,7 @@ def build_risk_layers(
 
     if rain_path and Path(rain_path).exists():
         rain_arr, _ = read_raster_window(Path(rain_path), bounds)
+        rain_source = str(rain_path)
     else:
         rain_arr = np.full_like(dem_arr, 80.0)
 
@@ -445,15 +541,40 @@ def build_risk_layers(
     )
     risk = np.clip(risk, 1.0, 10.0)
 
+    # Refresh catalogue data_status with actual sources for this run
+    catalogue = []
+    for d in DRIVER_CATALOGUE:
+        entry = dict(d)
+        entry["weight"] = w[d["key"]]
+        if d["key"] == "precip":
+            entry["data_status"] = rain_source
+        elif d["key"] == "dist_water":
+            entry["data_status"] = water_source
+        elif d["key"] == "dem":
+            entry["data_status"] = dem_source
+        elif d["key"] == "slope":
+            entry["data_status"] = f"Derived from DEM ({dem_source})"
+        catalogue.append(entry)
+
     return {
         "risk": risk,
         "dem_arr": dem_arr,
         "slope_arr": slope_arr,
         "dist_arr": dist_arr,
         "rain_arr": rain_arr,
+        # Scaled driver surfaces (1-10) used for score and contribution
+        "precip_r": precip_r,
+        "dist_r": dist_r,
+        "lulc_r": lulc_r,
+        "slope_r": slope_r,
+        "dem_r": dem_r,
         "transform": transform,
         "bounds": bounds,
         "dem_source": dem_source,
+        "rain_source": rain_source,
+        "water_source": water_source,
+        "weights": w,
+        "driver_catalogue": catalogue,
     }
 
 
@@ -462,10 +583,33 @@ def score_segments(
     layers: Dict[str, Any],
     corridor_half_width_m: float = CORRIDOR_HALF_WIDTH_M,
 ) -> List[Dict[str, Any]]:
-    """Sample drivers under each segment corridor and compute scores."""
+    """
+    Sample drivers under each segment corridor and compute scores.
+
+    The composite score still uses the fixed global weights. For each segment,
+    driver contributions are also stored so the leading factors at that location
+    can be reported (contribution_d = weight_d * scaled_driver_d).
+    """
     metric_segs = to_metric_crs(segments)
     transform = layers["transform"]
+    w = layers.get("weights", DEFAULT_WEIGHTS)
     scored: List[Dict[str, Any]] = []
+
+    driver_keys = ("precip", "dist_water", "lulc", "slope", "dem")
+    scaled_layers = {
+        "precip": layers["precip_r"],
+        "dist_water": layers["dist_r"],
+        "lulc": layers["lulc_r"],
+        "slope": layers["slope_r"],
+        "dem": layers["dem_r"],
+    }
+    name_map = {
+        "precip": "Precipitation",
+        "dist_water": "Water proximity / local low",
+        "lulc": "Land cover",
+        "slope": "Slope",
+        "dem": "Elevation",
+    }
 
     for i, (_, row) in enumerate(segments.iterrows()):
         geom = row.geometry
@@ -473,15 +617,29 @@ def score_segments(
         buf = mrow.geometry.buffer(corridor_half_width_m)
         buf_wgs = gpd.GeoSeries([buf], crs=metric_segs.crs).to_crs(epsg=4326).iloc[0]
 
-        base = zonal_mean(buf_wgs, layers["risk"], transform)
         dem_m = zonal_mean(buf_wgs, layers["dem_arr"], transform)
         slope_m = zonal_mean(buf_wgs, layers["slope_arr"], transform)
         dist_m = zonal_mean(buf_wgs, layers["dist_arr"], transform)
         rain_m = zonal_mean(buf_wgs, layers["rain_arr"], transform)
 
-        if base is None:
-            base = 5.0
-        final = float(np.clip(base, 1.0, 10.0))
+        # Scaled driver values (1-10) and weighted contributions at this segment
+        scaled: Dict[str, float] = {}
+        contrib: Dict[str, float] = {}
+        for key in driver_keys:
+            val = zonal_mean(buf_wgs, scaled_layers[key], transform)
+            if val is None:
+                val = 5.0
+            scaled[key] = float(val)
+            contrib[key] = float(w[key] * scaled[key])
+
+        final = float(np.clip(sum(contrib.values()), 1.0, 10.0))
+        # Rank drivers by contribution (highest first) for this location
+        ranked = sorted(contrib.items(), key=lambda kv: kv[1], reverse=True)
+        top_drivers = "; ".join(
+            f"{name_map[k]} ({c:.2f})" for k, c in ranked[:3]
+        )
+        primary_driver = name_map[ranked[0][0]] if ranked else "N/A"
+
         cat = score_to_rozvi_category(final)
         band = rozvi_band(cat)
         cen = geom.centroid if geom and not geom.is_empty else None
@@ -500,10 +658,25 @@ def score_segments(
                 "band": band,
                 "relative_risk_score": relative_risk_score_from_category(cat),
                 "dominant_peril": "pluvial",
+                # Physical samples
                 "elev_m": None if dem_m is None else round(dem_m, 1),
                 "slope_deg": None if slope_m is None else round(slope_m, 2),
                 "dist_water_proxy_m": None if dist_m is None else round(dist_m, 1),
                 "forecast_rain_mm": None if rain_m is None else round(rain_m, 1),
+                # Scaled drivers (1-10) at this segment
+                "drv_precip_scaled": round(scaled["precip"], 2),
+                "drv_dist_water_scaled": round(scaled["dist_water"], 2),
+                "drv_lulc_scaled": round(scaled["lulc"], 2),
+                "drv_slope_scaled": round(scaled["slope"], 2),
+                "drv_dem_scaled": round(scaled["dem"], 2),
+                # Weighted contributions (weight * scaled); sum ~= final_score
+                "contrib_precip": round(contrib["precip"], 3),
+                "contrib_dist_water": round(contrib["dist_water"], 3),
+                "contrib_lulc": round(contrib["lulc"], 3),
+                "contrib_slope": round(contrib["slope"], 3),
+                "contrib_dem": round(contrib["dem"], 3),
+                "primary_driver": primary_driver,
+                "top_drivers": top_drivers,
                 "lon": None if cen is None else round(cen.x, 6),
                 "lat": None if cen is None else round(cen.y, 6),
                 "length_m": float(row.get("length_m", SEGMENT_LENGTH_M)),
@@ -565,14 +738,40 @@ def portfolio_metrics(scored: List[Dict], seg_len: float) -> Dict[str, Any]:
 # Exports
 # ---------------------------------------------------------------------------
 
+def export_driver_register(layers: Dict[str, Any], out_dir: Path) -> Path:
+    """Table of risk drivers, weights and data sources for the run."""
+    rows = []
+    for d in layers.get("driver_catalogue", DRIVER_CATALOGUE):
+        rows.append(
+            {
+                "driver_key": d["key"],
+                "driver_name": d["name"],
+                "weight": d["weight"],
+                "weight_pct": round(d["weight"] * 100, 1),
+                "direction": d["direction"],
+                "scaling": d["scaling"],
+                "data_status": d["data_status"],
+            }
+        )
+    path = out_dir / f"Risk_Driver_Weights_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    print(f"  Wrote {path}")
+    return path
+
+
 def export_executive_summary(
-    scored: List[Dict], seg_len: float, metrics: Dict[str, Any], out_dir: Path
+    scored: List[Dict],
+    seg_len: float,
+    metrics: Dict[str, Any],
+    layers: Dict[str, Any],
+    out_dir: Path,
 ) -> Path:
     top = sorted(scored, key=lambda x: x["final_score"], reverse=True)[:5]
     top_ids = "; ".join(s["section_id"] for s in top)
     n = metrics["asset_count"]
     total_km = metrics["road_length_km"]
     exposed_km = metrics["n_assets_exposed_screening"] * seg_len / 1000.0
+    w = layers.get("weights", DEFAULT_WEIGHTS)
 
     row = {
         "report_title": f"{MODEL_NAME} – Executive Summary",
@@ -589,6 +788,15 @@ def export_executive_summary(
         "top_asset_category_score": metrics["top_asset_category_score"],
         "dominant_peril": metrics["dominant_peril"],
         "priority_locations": top_ids,
+        "weight_precip": w.get("precip"),
+        "weight_dist_water": w.get("dist_water"),
+        "weight_lulc": w.get("lulc"),
+        "weight_slope": w.get("slope"),
+        "weight_dem": w.get("dem"),
+        "climate_framework": CLIMATE_CONTEXT["framework"],
+        "climate_application": CLIMATE_CONTEXT["application"],
+        "model_calibration_status": MODEL_QUALITY["calibration_status"],
+        "model_validation_status": MODEL_QUALITY["validation_status"],
         "exposure_definition": (
             f"Segments with susceptibility score >= {SCREENING_THRESHOLD}. "
             "Risk category 0-100 is a linear map of the 1-10 score. "
@@ -604,7 +812,7 @@ def export_executive_summary(
         ),
         "important_caveats": (
             "Screening ranking only. No AEP depth grids, defence scenarios, "
-            "climate depth adjustment, or EAL/PML in this build."
+            "segment-scale climate depth adjustment, or EAL/PML in this build."
         ),
     }
     path = out_dir / f"Executive_Summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -640,6 +848,18 @@ def export_section_register(scored: List[Dict], seg_len: float, out_dir: Path) -
                 "slope_deg": s.get("slope_deg"),
                 "dist_water_proxy_m": s.get("dist_water_proxy_m"),
                 "forecast_rain_mm": s.get("forecast_rain_mm"),
+                "drv_precip_scaled": s.get("drv_precip_scaled"),
+                "drv_dist_water_scaled": s.get("drv_dist_water_scaled"),
+                "drv_lulc_scaled": s.get("drv_lulc_scaled"),
+                "drv_slope_scaled": s.get("drv_slope_scaled"),
+                "drv_dem_scaled": s.get("drv_dem_scaled"),
+                "contrib_precip": s.get("contrib_precip"),
+                "contrib_dist_water": s.get("contrib_dist_water"),
+                "contrib_lulc": s.get("contrib_lulc"),
+                "contrib_slope": s.get("contrib_slope"),
+                "contrib_dem": s.get("contrib_dem"),
+                "primary_driver": s.get("primary_driver"),
+                "top_drivers": s.get("top_drivers"),
                 "depth_100_undef_m": None,
                 "eal_present": None,
                 "result_state": "Modelled susceptibility (no calibrated AEP or depth)",
@@ -672,6 +892,13 @@ def export_asset_scores(scored: List[Dict], out_dir: Path) -> Path:
             "band": s["band"],
             "dominant_peril": s["dominant_peril"],
             "susceptibility_score_1_10": s["final_score"],
+            "primary_driver": s.get("primary_driver"),
+            "top_drivers": s.get("top_drivers"),
+            "contrib_precip": s.get("contrib_precip"),
+            "contrib_dist_water": s.get("contrib_dist_water"),
+            "contrib_lulc": s.get("contrib_lulc"),
+            "contrib_slope": s.get("contrib_slope"),
+            "contrib_dem": s.get("contrib_dem"),
             "depth_100_undef": None,
             "eal_present": None,
             "horizon": "present",
@@ -693,7 +920,7 @@ def export_payload(
     out_dir: Path,
     portfolio_name: str,
 ) -> Path:
-    """JSON payload aligned to report placeholders for downstream systems."""
+    """JSON payload for downstream systems and template fill."""
     bc = metrics["band_counts"]
     n = metrics["asset_count"]
     payload = {
@@ -706,6 +933,10 @@ def export_payload(
         "segment_length_m": seg_len,
         "dem_source": layers.get("dem_source"),
         "crs": "EPSG:4326",
+        "driver_weights": layers.get("weights", DEFAULT_WEIGHTS),
+        "driver_catalogue": layers.get("driver_catalogue", DRIVER_CATALOGUE),
+        "climate_context": CLIMATE_CONTEXT,
+        "model_quality": MODEL_QUALITY,
         "portfolio_mean_category": metrics["portfolio_mean_category"],
         "pct_assets_exposed_screening": metrics["pct_assets_exposed_screening"],
         "top_asset_name": metrics["top_asset_name"],
@@ -727,6 +958,15 @@ def export_payload(
                 "band": s["band"],
                 "relative_risk_score": s["relative_risk_score"],
                 "rank": s.get("rank"),
+                "primary_driver": s.get("primary_driver"),
+                "top_drivers": s.get("top_drivers"),
+                "contributions": {
+                    "precip": s.get("contrib_precip"),
+                    "dist_water": s.get("contrib_dist_water"),
+                    "lulc": s.get("contrib_lulc"),
+                    "slope": s.get("contrib_slope"),
+                    "dem": s.get("contrib_dem"),
+                },
             }
             for s in scored
         ],
@@ -808,6 +1048,7 @@ def generate_docx_report(
 
     n = metrics["asset_count"]
     bc = metrics["band_counts"]
+    catalogue = layers.get("driver_catalogue", DRIVER_CATALOGUE)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -818,12 +1059,13 @@ def generate_docx_report(
     run.font.name = "Arial"
     para(portfolio_name, size=12)
     para(
-        "Auto-generated screening report. Flood depth, EAL and return-period hazard "
-        "grids are not assessed in this build.",
+        "Screening report. Flood depth, EAL and return-period hazard grids are not "
+        "assessed in this build. Climate pathways are reported as regional context only.",
         size=9,
         italic=True,
     )
 
+    # 0 Metadata
     heading("0. Report metadata")
     meta = [
         ("Report title", f"Flood Risk Report – {portfolio_name}"),
@@ -834,6 +1076,7 @@ def generate_docx_report(
         ("Road length (km)", str(metrics["road_length_km"])),
         ("Segment length (m)", str(seg_len)),
         ("CRS", "EPSG:4326"),
+        ("Calibration status", MODEL_QUALITY["calibration_status"]),
     ]
     tbl = doc.add_table(rows=len(meta), cols=2)
     tbl.style = "Table Grid"
@@ -844,6 +1087,7 @@ def generate_docx_report(
         tbl.rows[i].cells[0].paragraphs[0].runs[0].bold = True
         _shade(tbl.rows[i].cells[0], "D6E3F0")
 
+    # 1 Executive summary
     heading("1. Executive summary")
     heading("1.1 Headline metrics", 2)
     head = [
@@ -881,24 +1125,85 @@ def generate_docx_report(
         _font_row(dt.rows[i])
     _hdr(dt.rows[0])
 
+    # 2 Method + drivers
     heading("2. Method")
     para(
-        "Susceptibility is a weighted combination of precipitation, proximity to water "
-        "(or height above local terrain minima), land cover (neutral when absent), "
-        "slope and elevation. Drivers are scaled to 1-10 with AOI percentile stretches. "
-        "Segment scores are corridor zonal means."
+        "Susceptibility is a weighted combination of the drivers listed below. "
+        "Each driver is scaled to the interval 1-10 using AOI percentile stretches "
+        "(2nd-98th). Segment scores are mean values sampled under a corridor buffer."
     )
     para(f"DEM source: {layers.get('dem_source')}.")
+
+    heading("2.1 Flood risk drivers and weights", 2)
+    drv_header = ["Driver", "Weight", "Weight %", "Direction", "Data used in this run"]
+    drv = doc.add_table(rows=1 + len(catalogue), cols=len(drv_header))
+    drv.style = "Table Grid"
+    for j, c in enumerate(drv_header):
+        drv.rows[0].cells[j].text = c
+    _hdr(drv.rows[0])
+    for i, d in enumerate(catalogue):
+        vals = [
+            d["name"],
+            f"{d['weight']:.2f}",
+            f"{d['weight'] * 100:.0f}%",
+            d["direction"],
+            str(d.get("data_status", "")),
+        ]
+        for j, v in enumerate(vals):
+            drv.rows[i + 1].cells[j].text = v
+        _font_row(drv.rows[i + 1], size=8)
     para(
-        "Return-period depths, defended/undefended cases, climate pathways and financial "
-        "loss are outside the scope of this screening build.",
+        f"Weights sum to {sum(d['weight'] for d in catalogue):.2f}. "
+        "Land cover is held at a neutral scaled value when no land-cover raster is supplied.",
         size=9,
         italic=True,
     )
 
+    heading("2.2 Climate context (CMIP6 / CMIP7)", 2)
+    para(f"Framework referenced: {CLIMATE_CONTEXT['framework']}.")
+    para(f"Pathways cited for narrative context: {CLIMATE_CONTEXT['pathways_referenced']}.")
+    para(CLIMATE_CONTEXT["application"])
+    para(CLIMATE_CONTEXT["cmip7_note"], size=9, italic=True)
+    para(
+        "Segment-scale climate-adjusted depths and probabilities: "
+        f"{CLIMATE_CONTEXT['segment_scale_climate']}.",
+        size=9,
+    )
+
+    heading("2.3 Model quality", 2)
+    quality_rows = [
+        ("Purpose", MODEL_QUALITY["purpose"]),
+        ("Calibration", MODEL_QUALITY["calibration_status"]),
+        ("Validation", MODEL_QUALITY["validation_status"]),
+        ("Spatial unit", MODEL_QUALITY["spatial_unit"]),
+        ("Vertical data limit", MODEL_QUALITY["vertical_data_limit"]),
+        ("Missing data policy", MODEL_QUALITY["missing_data_policy"]),
+        ("Suitable uses", MODEL_QUALITY["suitable_uses"]),
+        ("Unsuitable uses", MODEL_QUALITY["unsuitable_uses"]),
+    ]
+    qt = doc.add_table(rows=len(quality_rows), cols=2)
+    qt.style = "Table Grid"
+    for i, (a, b) in enumerate(quality_rows):
+        qt.rows[i].cells[0].text = a
+        qt.rows[i].cells[1].text = b
+        _font_row(qt.rows[i], size=8)
+        qt.rows[i].cells[0].paragraphs[0].runs[0].bold = True
+        _shade(qt.rows[i].cells[0], "D6E3F0")
+
+    # 3 Priority segments
     heading("3. Priority segments")
+    para(
+        "For each segment the composite score uses the fixed driver weights. "
+        "Primary driver and top drivers are the largest weighted contributions "
+        "at that location (contribution = weight × scaled driver value).",
+        size=9,
+        italic=True,
+    )
     top15 = sorted(scored, key=lambda x: x["risk_category_0_100"], reverse=True)[:15]
-    cols = ["Rank", "Section", "Chainage (m)", "Lat", "Lon", "Elev", "Slope", "Score", "Cat", "Band"]
+    cols = [
+        "Rank", "Section", "Chainage (m)", "Score", "Cat", "Band",
+        "Primary driver", "Top drivers (contribution)",
+    ]
     mt = doc.add_table(rows=1 + len(top15), cols=len(cols))
     mt.style = "Table Grid"
     for j, c in enumerate(cols):
@@ -909,13 +1214,11 @@ def generate_docx_report(
             str(s.get("rank")),
             str(s.get("section_id")),
             f"{s.get('chainage_start_m')}–{s.get('chainage_end_m')}",
-            str(s.get("lat")),
-            str(s.get("lon")),
-            str(s.get("elev_m")),
-            str(s.get("slope_deg")),
             str(s.get("final_score")),
             str(s.get("risk_category_0_100")),
             str(s.get("band")),
+            str(s.get("primary_driver")),
+            str(s.get("top_drivers")),
         ]
         for j, v in enumerate(vals):
             mt.rows[i + 1].cells[j].text = v
@@ -924,16 +1227,18 @@ def generate_docx_report(
     heading("4. Segment and chainage fields")
     para(
         f"Network divided into {n} segments of nominal length {seg_len} m. "
-        "Chainage is sequential from the first vertex of each parent road feature."
+        "Chainage is sequential from the first vertex of each parent road feature "
+        "and should be replaced with official alignment chainage when available."
     )
 
     heading("5. Limitations")
     for line in [
         "Outputs are relative susceptibility rankings, not calibrated probabilities or depths.",
-        "No return-period depth grids, defence performance, or climate depth adjustment.",
+        "No return-period depth grids, defence performance, or segment-scale climate depth adjustment.",
         "Coarse DEM sources cannot resolve low embankments or bridge decks.",
         "Chainage origin is model-derived unless replaced with official alignment data.",
         "Missing raster samples default toward a neutral susceptibility contribution.",
+        "CMIP pathways are cited for regional context only; they do not alter segment scores in this version.",
     ]:
         para(f"• {line}")
 
@@ -1000,6 +1305,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         water_path=Path(args.water) if args.water else None,
         rain_path=Path(args.rain) if args.rain else None,
     )
+    print("  Driver weights:", layers["weights"])
 
     print(f"\n[4/6] Scoring segments ...")
     scored = score_segments(segments, layers, corridor_half_width_m=args.corridor)
@@ -1008,7 +1314,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("  Band counts:", metrics["band_counts"])
 
     print(f"\n[5/6] Writing outputs -> {out_dir.resolve()}")
-    export_executive_summary(scored, args.seg_length, metrics, out_dir)
+    export_driver_register(layers, out_dir)
+    export_executive_summary(scored, args.seg_length, metrics, layers, out_dir)
     export_section_register(scored, args.seg_length, out_dir)
     export_asset_scores(scored, out_dir)
     export_payload(scored, metrics, layers, args.seg_length, out_dir, args.portfolio_name)
