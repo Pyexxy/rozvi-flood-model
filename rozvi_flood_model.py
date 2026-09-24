@@ -76,13 +76,22 @@ try:
 except ImportError:
     HAS_DOCX = False
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
 
 # ---------------------------------------------------------------------------
 # Model constants
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "Rozvi Flood Model"
-MODEL_VERSION = "1.2.1"
+MODEL_VERSION = "1.3.0"
 
 # Driver weights (must sum to 1.0). Applied after each driver is scaled to 1-10.
 DEFAULT_WEIGHTS = {
@@ -149,6 +158,14 @@ RISK_BANDS = [
     ("High", 61, 85),
     ("Extreme", 86, 100),
 ]
+
+BAND_COLORS = {
+    "Minimal": "#2ca02c",
+    "Low": "#98df8a",
+    "Moderate": "#ffbb78",
+    "High": "#ff7f0e",
+    "Extreme": "#d62728",
+}
 
 # Climate context (documentary only in this build)
 CLIMATE_CONTEXT = {
@@ -734,6 +751,201 @@ def portfolio_metrics(scored: List[Dict], seg_len: float) -> Dict[str, Any]:
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Figures (maps and charts for the Word report)
+# ---------------------------------------------------------------------------
+
+def _sorted_along_network(scored: List[Dict]) -> List[Dict]:
+    """Order segments by road then chainage for longitudinal plots."""
+    return sorted(
+        scored,
+        key=lambda s: (str(s.get("road_id", "")), float(s.get("chainage_mid_m") or 0.0)),
+    )
+
+
+def generate_figures(
+    scored: List[Dict],
+    metrics: Dict[str, Any],
+    out_dir: Path,
+) -> Dict[str, Path]:
+    """
+    Build insight figures from scored segments.
+
+    Returns a dict of figure keys to PNG paths. Requires matplotlib.
+    """
+    paths: Dict[str, Path] = {}
+    if not HAS_MPL or not scored:
+        if not HAS_MPL:
+            print("  [info] matplotlib not installed; skipping figures.")
+        return paths
+
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    n = len(scored)
+    bc = metrics.get("band_counts", {})
+
+    # --- 1. Risk band distribution (km and count) ---
+    try:
+        fig, ax = plt.subplots(figsize=(7.2, 3.6))
+        names = [b[0] for b in RISK_BANDS]
+        counts = [bc.get(name, 0) for name in names]
+        colors = [BAND_COLORS[name] for name in names]
+        bars = ax.barh(names, counts, color=colors, edgecolor="white")
+        ax.set_xlabel("Number of segments")
+        ax.set_title("Risk band distribution")
+        for bar, c in zip(bars, counts):
+            if c > 0:
+                ax.text(
+                    bar.get_width() + max(counts) * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    str(c),
+                    va="center",
+                    fontsize=8,
+                )
+        ax.set_xlim(0, max(counts) * 1.15 if max(counts) else 1)
+        fig.tight_layout()
+        path = fig_dir / "band_distribution.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths["band_distribution"] = path
+    except Exception as exc:
+        print(f"  [warn] band chart failed: {exc}")
+
+    # --- 2. Score histogram ---
+    try:
+        fig, ax = plt.subplots(figsize=(7.2, 3.4))
+        scores = [float(s["final_score"]) for s in scored]
+        ax.hist(scores, bins=18, range=(1, 10), color="#4c78a8", edgecolor="white")
+        ax.axvline(SCREENING_THRESHOLD, color="#d62728", linestyle="--", linewidth=1.2, label=f"Screening threshold ({SCREENING_THRESHOLD})")
+        ax.set_xlabel("Susceptibility score (1–10)")
+        ax.set_ylabel("Segment count")
+        ax.set_title("Distribution of susceptibility scores")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        path = fig_dir / "score_histogram.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths["score_histogram"] = path
+    except Exception as exc:
+        print(f"  [warn] histogram failed: {exc}")
+
+    # --- 3. Longitudinal profile along network order ---
+    try:
+        ordered = _sorted_along_network(scored)
+        # cumulative distance index (m) so multi-road corridors plot as one sequence
+        x = []
+        y = []
+        colors = []
+        cursor = 0.0
+        for s in ordered:
+            length = float(s.get("length_m") or SEGMENT_LENGTH_M)
+            cursor += length
+            x.append(cursor / 1000.0)  # km
+            y.append(float(s["final_score"]))
+            colors.append(BAND_COLORS.get(s.get("band"), "#999999"))
+        fig, ax = plt.subplots(figsize=(8.5, 3.6))
+        ax.scatter(x, y, c=colors, s=8, alpha=0.85, linewidths=0)
+        ax.plot(x, y, color="#333333", linewidth=0.4, alpha=0.35)
+        ax.axhline(SCREENING_THRESHOLD, color="#d62728", linestyle="--", linewidth=1.0)
+        ax.set_xlabel("Aligned distance along assessed network (km)")
+        ax.set_ylabel("Susceptibility score")
+        ax.set_ylim(1, 10)
+        ax.set_title("Longitudinal risk profile")
+        legend_items = [Patch(facecolor=BAND_COLORS[n], label=n) for n in names]
+        ax.legend(handles=legend_items, fontsize=7, loc="upper right", ncol=3)
+        fig.tight_layout()
+        path = fig_dir / "longitudinal_profile.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths["longitudinal_profile"] = path
+    except Exception as exc:
+        print(f"  [warn] longitudinal profile failed: {exc}")
+
+    # --- 4. Driver contributions for top segments ---
+    try:
+        top = sorted(scored, key=lambda s: s["risk_category_0_100"], reverse=True)[:12]
+        labels = [str(s.get("section_id")) for s in top]
+        keys = ["contrib_precip", "contrib_dist_water", "contrib_lulc", "contrib_slope", "contrib_dem"]
+        key_labels = ["Precipitation", "Water / low points", "Land cover", "Slope", "Elevation"]
+        key_colors = ["#4c78a8", "#72b7b2", "#54a24b", "#eeca3b", "#f58518"]
+        fig, ax = plt.subplots(figsize=(8.5, 4.2))
+        bottoms = [0.0] * len(top)
+        for key, lab, col in zip(keys, key_labels, key_colors):
+            vals = [float(s.get(key) or 0.0) for s in top]
+            ax.barh(labels, vals, left=bottoms, color=col, edgecolor="white", label=lab)
+            bottoms = [b + v for b, v in zip(bottoms, vals)]
+        ax.invert_yaxis()
+        ax.set_xlabel("Weighted contribution to score")
+        ax.set_title("Driver contributions — highest-ranked segments")
+        ax.legend(fontsize=7, loc="lower right")
+        fig.tight_layout()
+        path = fig_dir / "driver_contributions_top.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths["driver_contributions"] = path
+    except Exception as exc:
+        print(f"  [warn] driver contribution chart failed: {exc}")
+
+    # --- 5. Corridor map (segments coloured by band) ---
+    try:
+        fig, ax = plt.subplots(figsize=(8.0, 6.0))
+        plotted = 0
+        for s in scored:
+            geom = s.get("geometry")
+            if geom is None or geom.is_empty:
+                continue
+            color = BAND_COLORS.get(s.get("band"), "#999999")
+            if geom.geom_type == "LineString":
+                xs, ys = geom.xy
+                ax.plot(xs, ys, color=color, linewidth=1.6, solid_capstyle="round")
+                plotted += 1
+            elif geom.geom_type == "MultiLineString":
+                for part in geom.geoms:
+                    xs, ys = part.xy
+                    ax.plot(xs, ys, color=color, linewidth=1.6, solid_capstyle="round")
+                    plotted += 1
+        if plotted:
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title("Corridor susceptibility by risk band")
+            legend_items = [Patch(facecolor=BAND_COLORS[n], label=n) for n in names]
+            ax.legend(handles=legend_items, fontsize=8, loc="best")
+            ax.grid(True, linewidth=0.3, alpha=0.4)
+            fig.tight_layout()
+            path = fig_dir / "corridor_risk_map.png"
+            fig.savefig(path, dpi=150)
+            plt.close(fig)
+            paths["corridor_map"] = path
+        else:
+            plt.close(fig)
+    except Exception as exc:
+        print(f"  [warn] corridor map failed: {exc}")
+
+    # --- 6. Primary driver share (portfolio) ---
+    try:
+        from collections import Counter
+        counts = Counter(s.get("primary_driver") or "N/A" for s in scored)
+        labels = list(counts.keys())
+        vals = [counts[k] for k in labels]
+        fig, ax = plt.subplots(figsize=(7.2, 3.6))
+        ax.barh(labels, vals, color="#6b8cae", edgecolor="white")
+        ax.set_xlabel("Number of segments")
+        ax.set_title("Primary driver (largest contribution) by segment count")
+        fig.tight_layout()
+        path = fig_dir / "primary_driver_share.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        paths["primary_driver_share"] = path
+    except Exception as exc:
+        print(f"  [warn] primary driver chart failed: {exc}")
+
+    print(f"  Wrote {len(paths)} figure(s) under {fig_dir}")
+    return paths
+
+
+
 # ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
@@ -1022,6 +1234,7 @@ def generate_docx_report(
     seg_len: float,
     out_dir: Path,
     portfolio_name: str,
+    figures: Optional[Dict[str, Path]] = None,
 ) -> Optional[Path]:
     if not HAS_DOCX:
         print("  [info] python-docx not installed; skipping Word report.")
@@ -1125,6 +1338,14 @@ def generate_docx_report(
         _font_row(dt.rows[i])
     _hdr(dt.rows[0])
 
+    figures = figures or {}
+    if figures.get("band_distribution"):
+        para("Figure 1. Risk band distribution across assessed segments.", size=9, italic=True)
+        doc.add_picture(str(figures["band_distribution"]), width=Inches(5.8))
+    if figures.get("score_histogram"):
+        para("Figure 2. Distribution of susceptibility scores (1–10).", size=9, italic=True)
+        doc.add_picture(str(figures["score_histogram"]), width=Inches(5.8))
+
     # 2 Method + drivers
     heading("2. Method")
     para(
@@ -1190,6 +1411,36 @@ def generate_docx_report(
         qt.rows[i].cells[0].paragraphs[0].runs[0].bold = True
         _shade(qt.rows[i].cells[0], "D6E3F0")
 
+    if figures.get("corridor_map"):
+        heading("2.4 Corridor map", 2)
+        para(
+            "Segments coloured by risk band. This is a susceptibility ranking map, "
+            "not a flood inundation extent product.",
+            size=9,
+            italic=True,
+        )
+        doc.add_picture(str(figures["corridor_map"]), width=Inches(5.8))
+
+    if figures.get("longitudinal_profile"):
+        heading("2.5 Longitudinal risk profile", 2)
+        para(
+            "Susceptibility score along the assessed network in alignment order. "
+            "The dashed line marks the screening threshold.",
+            size=9,
+            italic=True,
+        )
+        doc.add_picture(str(figures["longitudinal_profile"]), width=Inches(6.2))
+
+    if figures.get("primary_driver_share"):
+        heading("2.6 Primary driver across the portfolio", 2)
+        para(
+            "Count of segments by the driver with the largest weighted contribution "
+            "at that location.",
+            size=9,
+            italic=True,
+        )
+        doc.add_picture(str(figures["primary_driver_share"]), width=Inches(5.8))
+
     # 3 Priority segments
     heading("3. Priority segments")
     para(
@@ -1223,6 +1474,15 @@ def generate_docx_report(
         for j, v in enumerate(vals):
             mt.rows[i + 1].cells[j].text = v
         _font_row(mt.rows[i + 1], size=8)
+
+    if figures.get("driver_contributions"):
+        para(
+            "Figure. Weighted driver contributions for the highest-ranked segments. "
+            "Bar length is the contribution to the composite score (weight × scaled driver).",
+            size=9,
+            italic=True,
+        )
+        doc.add_picture(str(figures["driver_contributions"]), width=Inches(6.2))
 
     heading("4. Segment and chainage fields")
     para(
@@ -1283,7 +1543,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: road file not found: {roads_path}")
         return 1
 
-    print(f"\n[1/6] Loading roads: {roads_path}")
+    print(f"\n[1/7] Loading roads: {roads_path}")
     roads = ensure_wgs84(gpd.read_file(roads_path))
     roads = roads[roads.geometry.type.isin(["LineString", "MultiLineString"])].copy()
     if roads.empty:
@@ -1291,14 +1551,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     print(f"  {len(roads)} line feature(s)")
 
-    print(f"\n[2/6] Segmenting (~{args.seg_length:.0f} m) ...")
+    print(f"\n[2/7] Segmenting (~{args.seg_length:.0f} m) ...")
     segments = segment_roads(roads, seg_len_m=args.seg_length, max_segments=args.max_segments)
     print(f"  {len(segments)} segments")
 
     minx, miny, maxx, maxy = segments.total_bounds
     pad = 0.02
     bounds = (minx - pad, miny - pad, maxx + pad, maxy + pad)
-    print(f"\n[3/6] Building risk layers {tuple(round(b, 4) for b in bounds)}")
+    print(f"\n[3/7] Building risk layers {tuple(round(b, 4) for b in bounds)}")
     layers = build_risk_layers(
         bounds,
         dem_path=Path(args.dem) if args.dem else None,
@@ -1307,13 +1567,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print("  Driver weights:", layers["weights"])
 
-    print(f"\n[4/6] Scoring segments ...")
+    print(f"\n[4/7] Scoring segments ...")
     scored = score_segments(segments, layers, corridor_half_width_m=args.corridor)
     scored = assign_chainage(scored, args.seg_length)
     metrics = portfolio_metrics(scored, args.seg_length)
     print("  Band counts:", metrics["band_counts"])
 
-    print(f"\n[5/6] Writing outputs -> {out_dir.resolve()}")
+    print(f"\n[5/7] Writing outputs -> {out_dir.resolve()}")
     export_driver_register(layers, out_dir)
     export_executive_summary(scored, args.seg_length, metrics, layers, out_dir)
     export_section_register(scored, args.seg_length, out_dir)
@@ -1321,10 +1581,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     export_payload(scored, metrics, layers, args.seg_length, out_dir, args.portfolio_name)
     export_geojson(scored, out_dir)
 
-    print("\n[6/6] Report")
+    print("\n[6/7] Figures")
+    figures = generate_figures(scored, metrics, out_dir)
+
+    print("\n[7/7] Report")
     if not args.no_docx:
         generate_docx_report(
-            scored, metrics, layers, args.seg_length, out_dir, args.portfolio_name
+            scored,
+            metrics,
+            layers,
+            args.seg_length,
+            out_dir,
+            args.portfolio_name,
+            figures=figures,
         )
 
     print("\nComplete.")
