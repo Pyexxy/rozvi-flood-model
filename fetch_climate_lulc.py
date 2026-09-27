@@ -7,6 +7,7 @@ Optional download of:
 
 * CHIRPS v2.0 precipitation (Climate Hazards Group) — used as the rainfall grid
 * ESA WorldCover land cover — used as the land-use / land-cover driver
+* DEM (SRTM via elevation, or Copernicus GLO-30 via Planetary Computer)
 
 Both products are retrieved over HTTPS, clipped to the study bounding box, and
 written as local GeoTIFFs so subsequent model runs can stay offline and
@@ -300,22 +301,174 @@ def worldcover_to_risk_array(lulc: np.ndarray) -> np.ndarray:
     return np.clip(out, 1.0, 10.0)
 
 
+
+def fetch_dem_srtm(
+    bounds: Tuple[float, float, float, float],
+    out_path: str | Path,
+    product: str = "SRTM3",
+) -> Path:
+    """
+    Download SRTM elevation for the bounding box via the elevation package.
+
+    Requires: pip install elevation
+    Needs network and a working GDAL/elevation install on the host.
+
+    product: "SRTM3" (~90 m) or "SRTM1" (~30 m) where supported.
+    """
+    try:
+        import elevation  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "DEM auto-fetch requires the 'elevation' package.\n"
+            "  pip install elevation\n"
+            f"Import error: {exc}"
+        ) from exc
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    minx, miny, maxx, maxy = bounds
+    # elevation.clip expects (west, south, east, north)
+    bb = (float(minx), float(miny), float(maxx), float(maxy))
+    print(f"  Fetching {product} DEM for bbox {bb} ...")
+    try:
+        elevation.clip(bounds=bb, output=str(out_path), product=product)
+        elevation.clean()
+    except Exception as exc:
+        raise RuntimeError(
+            f"SRTM download failed. Check network/GDAL/elevation setup.\n{exc}"
+        ) from exc
+
+    if not out_path.exists() or out_path.stat().st_size < 1000:
+        raise RuntimeError(f"DEM file missing or empty after download: {out_path}")
+    print(f"  Wrote DEM: {out_path}")
+    return out_path
+
+
+def fetch_dem_planetary(
+    bounds: Tuple[float, float, float, float],
+    out_path: str | Path,
+) -> Path:
+    """
+    Fetch Copernicus GLO-30 DEM via Microsoft Planetary Computer STAC (if available).
+
+    Falls back with a clear error so callers can try SRTM instead.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    minx, miny, maxx, maxy = bounds
+
+    try:
+        import pystac_client
+        import stackstac
+        import planetary_computer
+    except ImportError as exc:
+        raise RuntimeError(
+            "Copernicus DEM via Planetary Computer requires: "
+            "pystac-client, stackstac, planetary-computer\n"
+            f"{exc}"
+        ) from exc
+
+    print("  Querying Planetary Computer for Copernicus DEM (cop-dem-glo-30) ...")
+    catalog = pystac_client.Client.open(
+        WORLDCOVER_STAC,
+        modifier=planetary_computer.sign_inplace,
+    )
+    search = catalog.search(
+        collections=["cop-dem-glo-30"],
+        bbox=[minx, miny, maxx, maxy],
+    )
+    items = list(search.items())
+    if not items:
+        raise RuntimeError("No Copernicus DEM items for this bbox on Planetary Computer.")
+
+    stack = stackstac.stack(
+        items,
+        assets=["data"],
+        bounds_latlon=(minx, miny, maxx, maxy),
+        epsg=4326,
+        resolution=0.0003,  # ~30 m
+        chunksize=2048,
+    )
+    data = stack.isel(time=0).squeeze().values if "time" in stack.dims else stack.squeeze().values
+    if data.ndim > 2:
+        data = data[0]
+
+    height, width = data.shape
+    transform = rasterio.transform.from_bounds(minx, miny, maxx, maxy, width, height)
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 1,
+        "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": transform,
+        "compress": "lzw",
+        "tiled": False,
+        "nodata": -9999,
+    }
+    arr = np.asarray(data, dtype=np.float32)
+    arr[~np.isfinite(arr)] = -9999
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(arr, 1)
+    print(f"  Wrote DEM: {out_path}  shape={arr.shape}")
+    return out_path
+
+
+def fetch_dem(
+    bounds: Tuple[float, float, float, float],
+    out_path: str | Path,
+    prefer: str = "srtm",
+) -> Path:
+    """
+    Fetch a DEM for bounds. prefer: 'srtm' | 'copernicus' | 'auto'
+    auto tries Copernicus then SRTM.
+    """
+    out_path = Path(out_path)
+    prefer = (prefer or "srtm").lower()
+    errors = []
+
+    if prefer in ("copernicus", "auto"):
+        try:
+            return fetch_dem_planetary(bounds, out_path)
+        except Exception as exc:
+            errors.append(f"Copernicus: {exc}")
+            if prefer == "copernicus":
+                raise
+
+    if prefer in ("srtm", "auto"):
+        try:
+            return fetch_dem_srtm(bounds, out_path)
+        except Exception as exc:
+            errors.append(f"SRTM: {exc}")
+
+    raise RuntimeError(
+        "DEM auto-fetch failed.\n" + "\n".join(errors)
+    )
+
+
 def fetch_for_roads(
     roads_path: str | Path,
     out_dir: str | Path = "data",
     chirps_year: int = 2023,
     do_chirps: bool = True,
     do_worldcover: bool = True,
+    do_dem: bool = False,
+    dem_prefer: str = "srtm",
 ) -> dict:
     """
-    Convenience: derive bounds from a road network and fetch both products.
+    Convenience: derive bounds from a road network and fetch climate / LULC / DEM.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     bounds = bounds_from_vector(roads_path)
     print(f"AOI bounds (padded): {bounds}")
 
-    result = {"bounds": bounds, "chirps": None, "worldcover": None}
+    result = {"bounds": bounds, "chirps": None, "worldcover": None, "dem": None}
+    if do_dem:
+        result["dem"] = fetch_dem(
+            bounds, out_dir / "dem_auto.tif", prefer=dem_prefer
+        )
     if do_chirps:
         result["chirps"] = fetch_chirps_annual(
             chirps_year, bounds, out_dir / f"rainfall_chirps_{chirps_year}_mm.tif"
@@ -335,6 +488,10 @@ if __name__ == "__main__":
                    help="CHIRPS calendar year (mm/year). Choose the year that matches your study period.")
     p.add_argument("--no-chirps", action="store_true")
     p.add_argument("--no-worldcover", action="store_true")
+    p.add_argument("--dem", action="store_true",
+                   help="Also download a DEM for the road bbox (SRTM or Copernicus)")
+    p.add_argument("--dem-source", default="srtm", choices=["srtm", "copernicus", "auto"],
+                   help="DEM source when --dem is set (default: srtm)")
     args = p.parse_args()
 
     fetch_for_roads(
@@ -343,5 +500,7 @@ if __name__ == "__main__":
         chirps_year=args.chirps_year,
         do_chirps=not args.no_chirps,
         do_worldcover=not args.no_worldcover,
+        do_dem=args.dem,
+        dem_prefer=args.dem_source,
     )
     print("Done.")

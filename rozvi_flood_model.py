@@ -91,7 +91,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "Rozvi Flood Model"
-MODEL_VERSION = "1.4.1"
+MODEL_VERSION = "1.5.1"
 
 # Driver weights (must sum to 1.0). Applied after each driver is scaled to 1-10.
 DEFAULT_WEIGHTS = {
@@ -563,22 +563,49 @@ def build_risk_layers(
         dem_arr, transform = read_raster_window(Path(dem_path), bounds)
         dem_source = str(dem_path)
     else:
-        srtm = try_download_srtm(bounds, Path("cache_srtm_clip.tif"))
-        if srtm and srtm.exists():
-            dem_arr, transform = read_raster_window(srtm, bounds)
-            dem_source = "SRTM3 (elevation package)"
+        auto_dem = Path("data") / "dem_auto.tif"
+        fetched = None
+        try:
+            from fetch_climate_lulc import fetch_dem as _fetch_dem
+            print("  No local DEM; attempting auto-fetch ...")
+            fetched = _fetch_dem(bounds, auto_dem, prefer="auto")
+        except Exception as exc:
+            print(f"  [info] DEM auto-fetch helper unavailable or failed: {exc}")
+            fetched = try_download_srtm(bounds, Path("cache_srtm_clip.tif"))
+
+        if fetched and Path(fetched).exists():
+            dem_arr, transform = read_raster_window(Path(fetched), bounds)
+            dem_source = str(fetched)
+            print(f"  Using auto-fetched DEM: {dem_source}")
         else:
-            print("  [demo] No DEM supplied; using synthetic surface for testing only.")
+            print("  [demo] No DEM available; using synthetic surface for testing only.")
             dem_arr, transform = make_synthetic_dem(bounds)
             dem_source = "synthetic (demo)"
 
     dem_arr = np.where((dem_arr < -100) | (dem_arr > 9000), np.nan, dem_arr)
     slope_arr = slope_from_dem(dem_arr, transform)
 
+    # Land cover first (also used for permanent-water distance)
+    lulc_source = "neutral default (no land-cover raster)"
+    lulc_raw = None
+    if lulc_path and Path(lulc_path).exists():
+        print(f"  Reading LULC: {lulc_path}")
+        lulc_in, lulc_tf = read_raster_window(Path(lulc_path), bounds)
+        lulc_raw = resample_to_grid(
+            lulc_in, lulc_tf, dem_arr.shape, transform, Resampling.nearest
+        )
+        lulc_r = lulc_classes_to_risk(lulc_raw)
+        lulc_source = str(lulc_path)
+        print(f"  LULC resampled to DEM grid: {lulc_r.shape}")
+    else:
+        lulc_r = np.full_like(dem_arr, 5.0)
+
+    # Distance to permanent water: --water, else WorldCover class 80, else HAND-like
+    water_source = "HAND-like focal minimum proxy"
     if water_path and Path(water_path).exists():
-        water_raw, water_tf = read_raster_window(Path(water_path), bounds)
+        water_in, water_tf = read_raster_window(Path(water_path), bounds)
         water = resample_to_grid(
-            water_raw, water_tf, dem_arr.shape, transform, Resampling.nearest
+            water_in, water_tf, dem_arr.shape, transform, Resampling.nearest
         )
         from scipy.ndimage import distance_transform_edt
 
@@ -588,6 +615,26 @@ def build_risk_layers(
         scale = px * 111_320 if px < 0.1 else px
         dist_arr = dist_px * scale
         water_source = str(water_path)
+    elif lulc_raw is not None:
+        from scipy.ndimage import distance_transform_edt
+
+        permanent_water = (np.round(lulc_raw) == 80).astype(np.uint8)
+        if int(permanent_water.sum()) > 0:
+            inv = (permanent_water == 0).astype(np.uint8)
+            dist_px = distance_transform_edt(inv)
+            px = abs(transform.a)
+            scale = px * 111_320 if px < 0.1 else px
+            dist_arr = dist_px * scale
+            water_source = f"WorldCover permanent water (class 80) from {lulc_path}"
+            print(f"  Water distance from WorldCover class 80 ({int(permanent_water.sum())} px)")
+        elif ndimage is not None:
+            focal_min = ndimage.minimum_filter(
+                np.nan_to_num(dem_arr, nan=np.nanmax(dem_arr)), size=15
+            )
+            dist_arr = np.clip(dem_arr - focal_min, 0, None)
+            water_source = "HAND-like proxy (no class-80 water in LULC window)"
+        else:
+            dist_arr = np.zeros_like(dem_arr)
     elif ndimage is not None:
         focal_min = ndimage.minimum_filter(
             np.nan_to_num(dem_arr, nan=np.nanmax(dem_arr)), size=15
@@ -605,19 +652,6 @@ def build_risk_layers(
         print(f"  Rain resampled to DEM grid: {rain_arr.shape}")
     else:
         rain_arr = np.full_like(dem_arr, 80.0)
-
-    lulc_source = "neutral default (no land-cover raster)"
-    if lulc_path and Path(lulc_path).exists():
-        print(f"  Reading LULC: {lulc_path}")
-        lulc_raw, lulc_tf = read_raster_window(Path(lulc_path), bounds)
-        lulc_raw = resample_to_grid(
-            lulc_raw, lulc_tf, dem_arr.shape, transform, Resampling.nearest
-        )
-        lulc_r = lulc_classes_to_risk(lulc_raw)
-        lulc_source = str(lulc_path)
-        print(f"  LULC resampled to DEM grid: {lulc_r.shape}")
-    else:
-        lulc_r = np.full_like(dem_arr, 5.0)
 
     dem_r = adaptive_unit_scale(dem_arr, invert=True)
     slope_r = adaptive_unit_scale(slope_arr, invert=True)
@@ -846,11 +880,13 @@ def generate_figures(
     scored: List[Dict],
     metrics: Dict[str, Any],
     out_dir: Path,
+    seg_len: float = SEGMENT_LENGTH_M,
 ) -> Dict[str, Path]:
     """
-    Build insight figures from scored segments.
+    Build insight figures aimed at both technical and non-technical readers.
 
-    Returns a dict of figure keys to PNG paths. Requires matplotlib.
+    Titles and labels use plain language. Colours follow a simple traffic-light
+    style (green = lower concern, red = higher concern).
     """
     paths: Dict[str, Path] = {}
     if not HAS_MPL or not scored:
@@ -862,112 +898,207 @@ def generate_figures(
     fig_dir.mkdir(parents=True, exist_ok=True)
     n = len(scored)
     bc = metrics.get("band_counts", {})
+    total_km = float(metrics.get("road_length_km") or (n * seg_len / 1000.0))
 
-    # --- 1. Risk band distribution (km and count) ---
+    # Friendly labels for bands and drivers
+    band_order = [b[0] for b in RISK_BANDS]
+    band_plain = {
+        "Minimal": "Very low",
+        "Low": "Low",
+        "Moderate": "Medium",
+        "High": "High",
+        "Extreme": "Very high",
+    }
+    driver_plain = {
+        "Precipitation": "Rainfall",
+        "Water proximity / local low": "Near water or low ground",
+        "Land cover": "Land use",
+        "Slope": "Steepness of ground",
+        "Elevation": "Ground height",
+        "N/A": "Not available",
+    }
+
+    def _plain_driver(name: str) -> str:
+        return driver_plain.get(name, name)
+
+    # --- 1. How much of the road is in each risk level? ---
     try:
-        fig, ax = plt.subplots(figsize=(7.2, 3.6))
-        names = [b[0] for b in RISK_BANDS]
-        counts = [bc.get(name, 0) for name in names]
-        colors = [BAND_COLORS[name] for name in names]
-        bars = ax.barh(names, counts, color=colors, edgecolor="white")
-        ax.set_xlabel("Number of segments")
-        ax.set_title("Risk band distribution")
-        for bar, c in zip(bars, counts):
-            if c > 0:
+        fig, ax = plt.subplots(figsize=(7.5, 3.8))
+        counts = [bc.get(name, 0) for name in band_order]
+        kms = [c * seg_len / 1000.0 for c in counts]
+        pcts = [(c / n * 100.0) if n else 0.0 for c in counts]
+        labels = [band_plain.get(b, b) for b in band_order]
+        colors = [BAND_COLORS[b] for b in band_order]
+        bars = ax.barh(labels, pcts, color=colors, edgecolor="white", height=0.7)
+        ax.set_xlabel("Share of assessed road (%)")
+        ax.set_title("How much of the road sits in each risk level?")
+        for bar, pct, km in zip(bars, pcts, kms):
+            if pct > 0:
                 ax.text(
-                    bar.get_width() + max(counts) * 0.01,
+                    bar.get_width() + 0.4,
                     bar.get_y() + bar.get_height() / 2,
-                    str(c),
+                    f"{pct:.1f}%  (~{km:.1f} km)",
                     va="center",
                     fontsize=8,
                 )
-        ax.set_xlim(0, max(counts) * 1.15 if max(counts) else 1)
+        ax.set_xlim(0, max(pcts) * 1.35 if max(pcts) else 10)
+        ax.annotate(
+            "Green = lower relative concern · Red = higher relative concern\n"
+            "This is a ranking along the corridor, not a forecast of flood depth.",
+            xy=(0.0, -0.22),
+            xycoords="axes fraction",
+            fontsize=8,
+            color="#444444",
+        )
         fig.tight_layout()
         path = fig_dir / "band_distribution.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         paths["band_distribution"] = path
-    except Exception as exc:
-        print(f"  [warn] band chart failed: {exc}")
+    except Exception as exp:
+        print(f"  [warn] band chart failed: {exp}")
 
-    # --- 2. Score histogram ---
+    # --- 2. Simple attention split (friendlier than full histogram) ---
     try:
+        fig, ax = plt.subplots(figsize=(6.5, 3.2))
+        above = sum(1 for s in scored if float(s["final_score"]) >= SCREENING_THRESHOLD)
+        below = n - above
+        cats = ["Within normal\nscreening range", "Above attention\nthreshold"]
+        vals = [below / n * 100 if n else 0, above / n * 100 if n else 0]
+        cols = ["#98df8a", "#d62728"]
+        bars = ax.bar(cats, vals, color=cols, edgecolor="white", width=0.55)
+        ax.set_ylabel("Share of road segments (%)")
+        ax.set_title("How much of the corridor needs closer attention?")
+        ax.set_ylim(0, 100)
+        for bar, v, c in zip(bars, vals, [below, above]):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 1.5,
+                f"{v:.1f}%\n({c} segments)",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        ax.annotate(
+            f"Attention threshold = score {SCREENING_THRESHOLD} on the model scale (1–10).",
+            xy=(0.0, -0.18),
+            xycoords="axes fraction",
+            fontsize=8,
+            color="#444444",
+        )
+        fig.tight_layout()
+        path = fig_dir / "attention_split.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        paths["attention_split"] = path
+        # keep histogram for technical annex
         fig, ax = plt.subplots(figsize=(7.2, 3.4))
         scores = [float(s["final_score"]) for s in scored]
         ax.hist(scores, bins=18, range=(1, 10), color="#4c78a8", edgecolor="white")
-        ax.axvline(SCREENING_THRESHOLD, color="#d62728", linestyle="--", linewidth=1.2, label=f"Screening threshold ({SCREENING_THRESHOLD})")
-        ax.set_xlabel("Susceptibility score (1–10)")
-        ax.set_ylabel("Segment count")
-        ax.set_title("Distribution of susceptibility scores")
+        ax.axvline(
+            SCREENING_THRESHOLD,
+            color="#d62728",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"Attention threshold ({SCREENING_THRESHOLD})",
+        )
+        ax.set_xlabel("Model score (1 = lower concern, 10 = higher concern)")
+        ax.set_ylabel("Number of road sections")
+        ax.set_title("Detail: distribution of model scores")
         ax.legend(fontsize=8)
         fig.tight_layout()
         path = fig_dir / "score_histogram.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         paths["score_histogram"] = path
-    except Exception as exc:
-        print(f"  [warn] histogram failed: {exc}")
+    except Exception as exp:
+        print(f"  [warn] attention/histogram failed: {exp}")
 
-    # --- 3. Longitudinal profile along network order ---
+    # --- 3. Risk along the route ---
     try:
         ordered = _sorted_along_network(scored)
-        # cumulative distance index (m) so multi-road corridors plot as one sequence
-        x = []
-        y = []
-        colors = []
+        x, y, colors = [], [], []
         cursor = 0.0
         for s in ordered:
-            length = float(s.get("length_m") or SEGMENT_LENGTH_M)
+            length = float(s.get("length_m") or seg_len)
             cursor += length
-            x.append(cursor / 1000.0)  # km
+            x.append(cursor / 1000.0)
             y.append(float(s["final_score"]))
             colors.append(BAND_COLORS.get(s.get("band"), "#999999"))
-        fig, ax = plt.subplots(figsize=(8.5, 3.6))
-        ax.scatter(x, y, c=colors, s=8, alpha=0.85, linewidths=0)
-        ax.plot(x, y, color="#333333", linewidth=0.4, alpha=0.35)
-        ax.axhline(SCREENING_THRESHOLD, color="#d62728", linestyle="--", linewidth=1.0)
-        ax.set_xlabel("Aligned distance along assessed network (km)")
-        ax.set_ylabel("Susceptibility score")
+        fig, ax = plt.subplots(figsize=(8.8, 3.8))
+        ax.scatter(x, y, c=colors, s=10, alpha=0.9, linewidths=0)
+        ax.plot(x, y, color="#666666", linewidth=0.35, alpha=0.35)
+        ax.axhline(
+            SCREENING_THRESHOLD,
+            color="#d62728",
+            linestyle="--",
+            linewidth=1.0,
+            label="Attention threshold",
+        )
+        ax.set_xlabel("Distance along the assessed road network (km)")
+        ax.set_ylabel("Relative concern (model score)")
         ax.set_ylim(1, 10)
-        ax.set_title("Longitudinal risk profile")
-        legend_items = [Patch(facecolor=BAND_COLORS[n], label=n) for n in names]
-        ax.legend(handles=legend_items, fontsize=7, loc="upper right", ncol=3)
+        ax.set_title("Where along the route is concern higher?")
+        legend_items = [
+            Patch(facecolor=BAND_COLORS[b], label=band_plain.get(b, b)) for b in band_order
+        ]
+        ax.legend(handles=legend_items, fontsize=7, loc="upper right", ncol=3, title="Risk level")
+        ax.annotate(
+            "Peaks mark stretches that rank higher than neighbouring sections. "
+            "Not a prediction of water depth.",
+            xy=(0.0, -0.20),
+            xycoords="axes fraction",
+            fontsize=8,
+            color="#444444",
+        )
         fig.tight_layout()
         path = fig_dir / "longitudinal_profile.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         paths["longitudinal_profile"] = path
-    except Exception as exc:
-        print(f"  [warn] longitudinal profile failed: {exc}")
+    except Exception as exp:
+        print(f"  [warn] longitudinal profile failed: {exp}")
 
-    # --- 4. Driver contributions for top segments ---
+    # --- 4. Why top sections score higher ---
     try:
         top = sorted(scored, key=lambda s: s["risk_category_0_100"], reverse=True)[:12]
         labels = [str(s.get("section_id")) for s in top]
-        keys = ["contrib_precip", "contrib_dist_water", "contrib_lulc", "contrib_slope", "contrib_dem"]
-        key_labels = ["Precipitation", "Water / low points", "Land cover", "Slope", "Elevation"]
+        keys = [
+            ("contrib_precip", "Rainfall"),
+            ("contrib_dist_water", "Near water or low ground"),
+            ("contrib_lulc", "Land use"),
+            ("contrib_slope", "Steepness of ground"),
+            ("contrib_dem", "Ground height"),
+        ]
         key_colors = ["#4c78a8", "#72b7b2", "#54a24b", "#eeca3b", "#f58518"]
-        fig, ax = plt.subplots(figsize=(8.5, 4.2))
+        fig, ax = plt.subplots(figsize=(8.8, 4.4))
         bottoms = [0.0] * len(top)
-        for key, lab, col in zip(keys, key_labels, key_colors):
+        for (key, lab), col in zip(keys, key_colors):
             vals = [float(s.get(key) or 0.0) for s in top]
             ax.barh(labels, vals, left=bottoms, color=col, edgecolor="white", label=lab)
             bottoms = [b + v for b, v in zip(bottoms, vals)]
         ax.invert_yaxis()
-        ax.set_xlabel("Weighted contribution to score")
-        ax.set_title("Driver contributions — highest-ranked segments")
-        ax.legend(fontsize=7, loc="lower right")
+        ax.set_xlabel("How much each factor adds to the section score")
+        ax.set_title("Why do the highest-ranked sections stand out?")
+        ax.legend(fontsize=7, loc="lower right", title="Factor")
+        ax.annotate(
+            "Longer coloured segments mean that factor pushed the score up more at that location.",
+            xy=(0.0, -0.12),
+            xycoords="axes fraction",
+            fontsize=8,
+            color="#444444",
+        )
         fig.tight_layout()
         path = fig_dir / "driver_contributions_top.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         paths["driver_contributions"] = path
-    except Exception as exc:
-        print(f"  [warn] driver contribution chart failed: {exc}")
+    except Exception as exp:
+        print(f"  [warn] driver contribution chart failed: {exp}")
 
-    # --- 5. Corridor map (segments coloured by band) ---
+    # --- 5. Corridor map ---
     try:
-        fig, ax = plt.subplots(figsize=(8.0, 6.0))
+        fig, ax = plt.subplots(figsize=(8.2, 6.2))
         plotted = 0
         for s in scored:
             geom = s.get("geometry")
@@ -976,48 +1107,77 @@ def generate_figures(
             color = BAND_COLORS.get(s.get("band"), "#999999")
             if geom.geom_type == "LineString":
                 xs, ys = geom.xy
-                ax.plot(xs, ys, color=color, linewidth=1.6, solid_capstyle="round")
+                ax.plot(xs, ys, color=color, linewidth=1.8, solid_capstyle="round")
                 plotted += 1
             elif geom.geom_type == "MultiLineString":
                 for part in geom.geoms:
                     xs, ys = part.xy
-                    ax.plot(xs, ys, color=color, linewidth=1.6, solid_capstyle="round")
+                    ax.plot(xs, ys, color=color, linewidth=1.8, solid_capstyle="round")
                     plotted += 1
         if plotted:
             ax.set_aspect("equal", adjustable="datalim")
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")
-            ax.set_title("Corridor susceptibility by risk band")
-            legend_items = [Patch(facecolor=BAND_COLORS[n], label=n) for n in names]
-            ax.legend(handles=legend_items, fontsize=8, loc="best")
+            ax.set_title("Map of relative flood concern along the corridor")
+            legend_items = [
+                Patch(facecolor=BAND_COLORS[b], label=band_plain.get(b, b)) for b in band_order
+            ]
+            ax.legend(
+                handles=legend_items,
+                fontsize=8,
+                loc="best",
+                title="Risk level",
+            )
             ax.grid(True, linewidth=0.3, alpha=0.4)
+            ax.annotate(
+                "Colours show relative ranking only — not flooded area or water depth.",
+                xy=(0.0, -0.08),
+                xycoords="axes fraction",
+                fontsize=8,
+                color="#444444",
+            )
             fig.tight_layout()
             path = fig_dir / "corridor_risk_map.png"
-            fig.savefig(path, dpi=150)
+            fig.savefig(path, dpi=150, bbox_inches="tight")
             plt.close(fig)
             paths["corridor_map"] = path
         else:
             plt.close(fig)
-    except Exception as exc:
-        print(f"  [warn] corridor map failed: {exc}")
+    except Exception as exp:
+        print(f"  [warn] corridor map failed: {exp}")
 
-    # --- 6. Primary driver share (portfolio) ---
+    # --- 6. What is driving risk most often? ---
     try:
         from collections import Counter
-        counts = Counter(s.get("primary_driver") or "N/A" for s in scored)
-        labels = list(counts.keys())
-        vals = [counts[k] for k in labels]
-        fig, ax = plt.subplots(figsize=(7.2, 3.6))
+
+        raw_counts = Counter(s.get("primary_driver") or "N/A" for s in scored)
+        labels = [_plain_driver(k) for k in raw_counts.keys()]
+        vals = list(raw_counts.values())
+        # sort by count
+        pairs = sorted(zip(vals, labels), reverse=True)
+        vals = [p[0] for p in pairs]
+        labels = [p[1] for p in pairs]
+        fig, ax = plt.subplots(figsize=(7.5, 3.8))
         ax.barh(labels, vals, color="#6b8cae", edgecolor="white")
-        ax.set_xlabel("Number of segments")
-        ax.set_title("Primary driver (largest contribution) by segment count")
+        ax.invert_yaxis()
+        ax.set_xlabel("Number of road sections")
+        ax.set_title("What is the main factor most often?")
+        for i, v in enumerate(vals):
+            ax.text(v + max(vals) * 0.01, i, str(v), va="center", fontsize=8)
+        ax.annotate(
+            "For each section, the model picks the factor that contributed most to its score.",
+            xy=(0.0, -0.18),
+            xycoords="axes fraction",
+            fontsize=8,
+            color="#444444",
+        )
         fig.tight_layout()
         path = fig_dir / "primary_driver_share.png"
-        fig.savefig(path, dpi=150)
+        fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         paths["primary_driver_share"] = path
-    except Exception as exc:
-        print(f"  [warn] primary driver chart failed: {exc}")
+    except Exception as exp:
+        print(f"  [warn] primary driver chart failed: {exp}")
 
     print(f"  Wrote {len(paths)} figure(s) under {fig_dir}")
     return paths
@@ -1418,10 +1578,13 @@ def generate_docx_report(
 
     figures = figures or {}
     if figures.get("band_distribution"):
-        para("Figure 1. Risk band distribution across assessed segments.", size=9, italic=True)
+        para("Figure 1. Share of the assessed road in each risk level (green = lower concern, red = higher).", size=9, italic=True)
         doc.add_picture(str(figures["band_distribution"]), width=Inches(5.8))
-    if figures.get("score_histogram"):
-        para("Figure 2. Distribution of susceptibility scores (1–10).", size=9, italic=True)
+    if figures.get("attention_split"):
+        para("Figure 2. How much of the corridor is above the attention threshold.", size=9, italic=True)
+        doc.add_picture(str(figures["attention_split"]), width=Inches(5.4))
+    elif figures.get("score_histogram"):
+        para("Figure 2. Distribution of model scores (technical view).", size=9, italic=True)
         doc.add_picture(str(figures["score_histogram"]), width=Inches(5.8))
 
     # 2 Method + drivers
@@ -1490,37 +1653,37 @@ def generate_docx_report(
         _shade(qt.rows[i].cells[0], "D6E3F0")
 
     if figures.get("corridor_map"):
-        heading("2.4 Corridor map", 2)
+        heading("2.4 Map of relative concern", 2)
         para(
-            "Segments coloured by risk band. This is a susceptibility ranking map, "
-            "not a flood inundation extent product.",
+            "Map of relative concern along the corridor (green to red). "
+            "This ranks sections against each other; it is not a map of flooded area or water depth.",
             size=9,
             italic=True,
         )
         doc.add_picture(str(figures["corridor_map"]), width=Inches(5.8))
 
     if figures.get("longitudinal_profile"):
-        heading("2.5 Longitudinal risk profile", 2)
+        heading("2.5 Concern along the route", 2)
         para(
-            "Susceptibility score along the assessed network in alignment order. "
-            "The dashed line marks the screening threshold.",
+            "Relative concern along the route from start to end of the assessed network. "
+            "The dashed line is the attention threshold. Peaks are stretches that rank higher than their neighbours.",
             size=9,
             italic=True,
         )
         doc.add_picture(str(figures["longitudinal_profile"]), width=Inches(6.2))
 
     if figures.get("primary_driver_share"):
-        heading("2.6 Primary driver across the portfolio", 2)
+        heading("2.6 What is driving scores most often?", 2)
         para(
-            "Count of segments by the driver with the largest weighted contribution "
-            "at that location.",
+            "Which factor most often contributes the most to a section's score "
+            "(rainfall, near water or low ground, land use, steepness, or height).",
             size=9,
             italic=True,
         )
         doc.add_picture(str(figures["primary_driver_share"]), width=Inches(5.8))
 
     # 3 Priority segments
-    heading("3. Priority segments")
+    heading("3. Priority sections (highest relative concern)")
     para(
         "For each segment the composite score uses the fixed driver weights. "
         "Primary driver and top drivers are the largest weighted contributions "
@@ -1555,8 +1718,8 @@ def generate_docx_report(
 
     if figures.get("driver_contributions"):
         para(
-            "Figure. Weighted driver contributions for the highest-ranked segments. "
-            "Bar length is the contribution to the composite score (weight × scaled driver).",
+            "Figure. Why the highest-ranked sections stand out: each colour shows how much "
+            "a factor added to that section's score. Longer bars mean a stronger influence.",
             size=9,
             italic=True,
         )
@@ -1595,7 +1758,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description=f"{MODEL_NAME} – corridor flood susceptibility screening"
     )
     p.add_argument("--roads", required=True, help="Road network GeoJSON or Shapefile")
-    p.add_argument("--dem", default=None, help="Optional DEM GeoTIFF (recommended)")
+    p.add_argument("--dem", default=None, help="DEM GeoTIFF; if omitted, auto-fetch is attempted")
+    p.add_argument("--fetch-dem", action="store_true", help="Download DEM to data/dem_auto.tif before scoring")
+    p.add_argument("--dem-source", default="auto", choices=["srtm", "copernicus", "auto"],
+                   help="DEM source for auto-fetch (default: auto)")
     p.add_argument("--water", default=None, help="Optional water-mask GeoTIFF")
     p.add_argument("--rain", default=None, help="Optional rainfall GeoTIFF (mm), e.g. CHIRPS clip")
     p.add_argument("--lulc", default=None, help="Optional land-cover GeoTIFF (e.g. ESA WorldCover)")
@@ -1637,10 +1803,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     minx, miny, maxx, maxy = segments.total_bounds
     pad = 0.02
     bounds = (minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+    dem_path = Path(args.dem) if args.dem else None
+    auto_path = Path("data") / "dem_auto.tif"
+    if args.fetch_dem or dem_path is None:
+        if dem_path is not None and dem_path.exists() and not args.fetch_dem:
+            pass
+        elif auto_path.exists() and not args.fetch_dem:
+            dem_path = auto_path
+            print(f"\n  Using existing auto DEM: {auto_path}")
+        else:
+            try:
+                from fetch_climate_lulc import fetch_dem as _fetch_dem
+                print(f"\n[3a/7] Fetching DEM ({args.dem_source}) ...")
+                dem_path = _fetch_dem(bounds, auto_path, prefer=args.dem_source)
+            except Exception as exc:
+                print(f"  [warn] Pre-fetch DEM failed: {exc}")
+
     print(f"\n[3/7] Building risk layers {tuple(round(b, 4) for b in bounds)}")
     layers = build_risk_layers(
         bounds,
-        dem_path=Path(args.dem) if args.dem else None,
+        dem_path=dem_path,
         water_path=Path(args.water) if args.water else None,
         rain_path=Path(args.rain) if args.rain else None,
         lulc_path=Path(args.lulc) if args.lulc else None,
@@ -1662,7 +1845,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     export_geojson(scored, out_dir)
 
     print("\n[6/7] Figures")
-    figures = generate_figures(scored, metrics, out_dir)
+    figures = generate_figures(scored, metrics, out_dir, seg_len=args.seg_length)
 
     print("\n[7/7] Report")
     if not args.no_docx:
