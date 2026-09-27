@@ -100,6 +100,27 @@ conda activate rozvi-flood
 
 ---
 
+
+## Fresh clone checklist
+
+After `git clone` and `pip install -r requirements.txt`:
+
+1. **Core packages** — `requirements.txt` includes `matplotlib` and the rest of the stack used by the model and Word report.
+2. **Sample road** — `data/sample/roads_sample.geojson` is part of the repo (used by tests).
+3. **Large rasters are not in git** — `.gitignore` excludes `*.tif`. You will not get `dem.tif`, CHIRPS, or WorldCover from GitHub. Copy your DEM locally and/or run `fetch_climate_lulc.py` (see [data/README.md](data/README.md)).
+4. **Sidecar files** — If the repo shows `dem.tfw` / `dem.tif.xml` without `dem.tif`, those are georeferencing/metadata leftovers only; the elevation grid must be supplied separately.
+
+```bash
+# Verify sample + tests
+pytest tests/test_smoke.py -q
+
+# Demo run (synthetic DEM if no --dem)
+python rozvi_flood_model.py --roads data/sample/roads_sample.geojson --outdir outputs --portfolio-name "Sample"
+
+# Full-style run (after you add dem / rain / lulc under data/)
+python rozvi_flood_model.py --roads data/roads.geojson --dem data/dem.tif --rain data/rainfall_chirps_2023_mm.tif --lulc data/worldcover.tif --outdir outputs
+```
+
 ## Inputs
 
 | Argument | Required | Description |

@@ -1,11 +1,12 @@
-"""Smoke test: segment sample road and produce score fields."""
+"""Smoke tests for geometry helpers and sample road segmentation."""
 from pathlib import Path
 import sys
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import geopandas as gpd
 from rozvi_flood_model import (
     ensure_wgs84,
     segment_roads,
@@ -24,6 +25,13 @@ def test_score_mapping():
 
 def test_sample_segmentation():
     path = ROOT / "data" / "sample" / "roads_sample.geojson"
+    if not path.is_file():
+        pytest.skip(
+            f"Sample file missing: {path}. "
+            "Ensure data/sample/roads_sample.geojson is committed to the repository."
+        )
+    import geopandas as gpd
+
     gdf = ensure_wgs84(gpd.read_file(path))
     segs = segment_roads(gdf, seg_len_m=100, max_segments=50)
     assert len(segs) >= 1
